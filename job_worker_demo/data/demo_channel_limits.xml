@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <record id="queue_limit_demo" model="queue.limit">
+        <field name="name">demo</field>
+        <field name="limit">4</field>
+        <field name="rate_limit">0</field>
+    </record>
+
+    <record id="queue_limit_demo_throttled" model="queue.limit">
+        <field name="name">demo_throttled</field>
+        <field name="limit">1</field>
+        <field name="rate_limit">0</field>
+    </record>
+
+    <record id="queue_limit_demo_bulk" model="queue.limit">
+        <field name="name">demo_bulk</field>
+        <field name="limit">2</field>
+        <field name="rate_limit">5</field>
+    </record>
+</odoo>

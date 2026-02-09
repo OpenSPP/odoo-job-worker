@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <record id="action_queue_job_mass_requeue" model="ir.actions.server">
+        <field name="name">Requeue Selected Jobs</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field name="binding_model_id" ref="model_queue_job" />
+        <field name="binding_view_types">list</field>
+        <field name="state">code</field>
+        <field name="code">records.button_requeue()</field>
+    </record>
+
+    <record id="action_queue_job_mass_set_done" model="ir.actions.server">
+        <field name="name">Set Selected Jobs to Done</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field name="binding_model_id" ref="model_queue_job" />
+        <field name="binding_view_types">list</field>
+        <field name="state">code</field>
+        <field name="code">records.button_set_to_done()</field>
+    </record>
+
+    <record id="action_queue_job_mass_set_failed" model="ir.actions.server">
+        <field name="name">Set Selected Jobs to Failed</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field name="binding_model_id" ref="model_queue_job" />
+        <field name="binding_view_types">list</field>
+        <field name="state">code</field>
+        <field name="code">records.button_set_to_failed()</field>
+    </record>
+</odoo>

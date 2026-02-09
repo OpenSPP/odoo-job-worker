@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <menuitem
+    id="menu_queue_job_dashboard"
+    name="Dashboard"
+    parent="job_worker.menu_queue_job_root"
+    action="action_queue_job_dashboard"
+    sequence="5"
+    groups="job_worker.group_queue_job_user,base.group_system"
+  />
+
+    <menuitem
+    id="menu_queue_limit_health"
+    name="Channels"
+    parent="job_worker.menu_queue_job_root"
+    action="action_queue_limit_health"
+    sequence="15"
+    groups="job_worker.group_queue_job_user,base.group_system"
+  />
+
+    <menuitem
+    id="menu_queue_job_trends"
+    name="Trends"
+    parent="job_worker.menu_queue_job_root"
+    action="action_queue_job_metric"
+    sequence="16"
+    groups="job_worker.group_queue_job_user,base.group_system"
+  />
+
+    <menuitem
+    id="menu_queue_job_alert_rules"
+    name="Alert Rules"
+    parent="job_worker.menu_queue_job_config"
+    action="action_queue_job_alert_rule"
+    sequence="20"
+    groups="job_worker.group_queue_job_manager,base.group_system"
+  />
+</odoo>

@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- List View -->
+    <record id="view_queue_job_metric_tree" model="ir.ui.view">
+        <field name="name">queue.job.metric.tree</field>
+        <field name="model">queue.job.metric</field>
+        <field name="arch" type="xml">
+            <list string="Metric Snapshots" create="false" delete="false">
+                <field name="snapshot_at" />
+                <field name="channel" />
+                <field name="period" />
+                <field name="jobs_completed" />
+                <field name="jobs_failed" />
+                <field name="average_duration" />
+                <field name="p95_duration" />
+                <field name="queue_depth" />
+                <field name="active_workers" />
+            </list>
+        </field>
+    </record>
+
+    <!-- Search View -->
+    <record id="view_queue_job_metric_search" model="ir.ui.view">
+        <field name="name">queue.job.metric.search</field>
+        <field name="model">queue.job.metric</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="channel" />
+                <filter
+          string="5 Minutes"
+          name="period_5min"
+          domain="[('period', '=', '5min')]"
+        />
+                <filter
+          string="Hourly"
+          name="period_1hour"
+          domain="[('period', '=', '1hour')]"
+        />
+                <filter
+          string="Daily"
+          name="period_1day"
+          domain="[('period', '=', '1day')]"
+        />
+                <separator />
+                <filter
+          string="Last 24h"
+          name="last_24h"
+          domain="[('snapshot_at', '&gt;=', (context_today() - datetime.timedelta(days=1)).strftime('%%Y-%%m-%%d'))]"
+        />
+                <filter
+          string="Last 7 Days"
+          name="last_7_days"
+          domain="[('snapshot_at', '&gt;=', (context_today() - datetime.timedelta(days=7)).strftime('%%Y-%%m-%%d'))]"
+        />
+                <group>
+                    <filter
+            string="Channel"
+            name="group_by_channel"
+            domain="[]"
+            context="{'group_by': 'channel'}"
+          />
+                    <filter
+            string="Period"
+            name="group_by_period"
+            domain="[]"
+            context="{'group_by': 'period'}"
+          />
+                    <filter
+            string="Snapshot Date"
+            name="group_by_snapshot"
+            domain="[]"
+            context="{'group_by': 'snapshot_at:day'}"
+          />
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- Graph View: Throughput Over Time -->
+    <record id="view_queue_job_metric_graph_throughput" model="ir.ui.view">
+        <field name="name">queue.job.metric.graph.throughput</field>
+        <field name="model">queue.job.metric</field>
+        <field name="arch" type="xml">
+            <graph string="Throughput Over Time" type="line">
+                <field name="snapshot_at" type="row" interval="hour" />
+                <field name="jobs_completed" type="measure" />
+                <field name="jobs_failed" type="measure" />
+            </graph>
+        </field>
+    </record>
+
+    <!-- Pivot View -->
+    <record id="view_queue_job_metric_pivot" model="ir.ui.view">
+        <field name="name">queue.job.metric.pivot</field>
+        <field name="model">queue.job.metric</field>
+        <field name="arch" type="xml">
+            <pivot string="Metric Analysis">
+                <field name="channel" type="row" />
+                <field name="snapshot_at" type="col" interval="day" />
+                <field name="jobs_completed" type="measure" />
+                <field name="jobs_failed" type="measure" />
+                <field name="average_duration" type="measure" />
+                <field name="p95_duration" type="measure" />
+                <field name="queue_depth" type="measure" />
+            </pivot>
+        </field>
+    </record>
+
+    <!-- Action -->
+    <record id="action_queue_job_metric" model="ir.actions.act_window">
+        <field name="name">Trends</field>
+        <field name="res_model">queue.job.metric</field>
+        <field name="view_mode">graph,pivot,list</field>
+        <field
+      name="context"
+    >{'search_default_last_7_days': 1, 'search_default_period_1hour': 1}</field>
+    </record>
+</odoo>

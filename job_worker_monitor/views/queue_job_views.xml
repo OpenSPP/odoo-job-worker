@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- Extend list view with monitor fields -->
+    <record id="view_queue_job_tree_monitor" model="ir.ui.view">
+        <field name="name">queue.job.tree.monitor</field>
+        <field name="model">queue.job</field>
+        <field name="inherit_id" ref="job_worker.view_queue_job_tree" />
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='identity_key']" position="after">
+                <field name="model_name" optional="hide" />
+                <field name="method_name" optional="hide" />
+                <field name="exc_name" optional="hide" />
+                <field name="is_retry_exhausted" optional="hide" />
+            </xpath>
+        </field>
+    </record>
+
+    <!-- Extend search view with monitor group-by -->
+    <record id="view_queue_job_search_monitor" model="ir.ui.view">
+        <field name="name">queue.job.search.monitor</field>
+        <field name="model">queue.job</field>
+        <field name="inherit_id" ref="job_worker.view_queue_job_search" />
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='identity_key']" position="after">
+                <field name="model_name" />
+                <field name="method_name" />
+                <field name="exc_name" />
+            </xpath>
+            <xpath expr="//filter[@name='group_by_graph']" position="after">
+                <filter
+          string="Retry Exhausted"
+          name="filter_retry_exhausted"
+          domain="[('is_retry_exhausted', '=', True)]"
+        />
+                <separator />
+                <filter
+          string="Model"
+          name="group_by_model_name"
+          domain="[]"
+          context="{'group_by': 'model_name'}"
+        />
+                <filter
+          string="Method"
+          name="group_by_method_name"
+          domain="[]"
+          context="{'group_by': 'method_name'}"
+        />
+                <filter
+          string="Exception"
+          name="group_by_exc_name"
+          domain="[]"
+          context="{'group_by': 'exc_name'}"
+        />
+            </xpath>
+        </field>
+    </record>
+</odoo>

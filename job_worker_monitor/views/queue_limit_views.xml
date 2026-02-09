@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- Channel Health Kanban View -->
+    <record id="view_queue_limit_kanban_health" model="ir.ui.view">
+        <field name="name">queue.limit.kanban.health</field>
+        <field name="model">queue.limit</field>
+        <field name="arch" type="xml">
+            <kanban class="o_kanban_dashboard" create="false">
+                <field name="name" />
+                <field name="limit" />
+                <field name="current_running" />
+                <field name="current_pending" />
+                <field name="current_failed" />
+                <field name="utilization_percent" />
+                <templates>
+                    <t t-name="card">
+                        <div class="o_kanban_card_header">
+                            <div class="o_kanban_card_header_title">
+                                <strong><field name="name" /></strong>
+                            </div>
+                        </div>
+                        <div class="container">
+                            <div class="row mt-2">
+                                <div class="col-6">
+                                    <span class="text-muted">Running</span>
+                                    <div class="fw-bold">
+                                        <field name="current_running" />
+                                        <span class="text-muted"> / <field
+                        name="limit"
+                      /></span>
+                                    </div>
+                                </div>
+                                <div class="col-6">
+                                    <span class="text-muted">Utilization</span>
+                                    <div class="fw-bold">
+                                        <field
+                      name="utilization_percent"
+                      widget="progressbar"
+                    />
+                                    </div>
+                                </div>
+                            </div>
+                            <div class="row mt-2">
+                                <div class="col-4">
+                                    <span class="text-muted">Pending</span>
+                                    <div class="fw-bold text-warning">
+                                        <field name="current_pending" />
+                                    </div>
+                                </div>
+                                <div class="col-4">
+                                    <span class="text-muted">Failed</span>
+                                    <div class="fw-bold text-danger">
+                                        <field name="current_failed" />
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </t>
+                </templates>
+            </kanban>
+        </field>
+    </record>
+
+    <!-- Extend list view with health columns -->
+    <record id="view_queue_limit_tree_monitor" model="ir.ui.view">
+        <field name="name">queue.limit.tree.monitor</field>
+        <field name="model">queue.limit</field>
+        <field name="inherit_id" ref="job_worker.view_queue_limit_tree" />
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='rate_limit']" position="after">
+                <field name="current_running" />
+                <field name="current_pending" />
+                <field name="current_failed" />
+                <field name="utilization_percent" widget="progressbar" />
+            </xpath>
+        </field>
+    </record>
+
+    <record id="action_queue_limit_health" model="ir.actions.act_window">
+        <field name="name">Channel Health</field>
+        <field name="res_model">queue.limit</field>
+        <field name="view_mode">kanban,list,form</field>
+        <field name="view_id" ref="view_queue_limit_kanban_health" />
+    </record>
+</odoo>

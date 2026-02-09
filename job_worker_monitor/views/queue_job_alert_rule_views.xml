@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- List View -->
+    <record id="view_queue_job_alert_rule_tree" model="ir.ui.view">
+        <field name="name">queue.job.alert.rule.tree</field>
+        <field name="model">queue.job.alert.rule</field>
+        <field name="arch" type="xml">
+            <list string="Alert Rules">
+                <field name="name" />
+                <field name="active" />
+                <field name="metric" />
+                <field name="channel" />
+                <field name="operator" />
+                <field name="threshold" />
+                <field name="last_value" />
+                <field name="last_triggered_at" />
+            </list>
+        </field>
+    </record>
+
+    <!-- Form View -->
+    <record id="view_queue_job_alert_rule_form" model="ir.ui.view">
+        <field name="name">queue.job.alert.rule.form</field>
+        <field name="model">queue.job.alert.rule</field>
+        <field name="arch" type="xml">
+            <form string="Alert Rule">
+                <header>
+                    <button
+            name="action_test_rule"
+            string="Test Rule"
+            type="object"
+            class="oe_highlight"
+          />
+                </header>
+                <sheet>
+                    <div class="oe_title">
+                        <h1><field name="name" placeholder="Rule Name" /></h1>
+                    </div>
+                    <group>
+                        <group string="Condition">
+                            <field name="active" />
+                            <field name="metric" />
+                            <field
+                name="channel"
+                placeholder="Leave blank for all channels"
+              />
+                            <field name="operator" />
+                            <field name="threshold" />
+                            <field name="evaluation_window_minutes" />
+                        </group>
+                        <group string="Notification">
+                            <field name="cooldown_minutes" />
+                            <field
+                name="notification_user_ids"
+                widget="many2many_tags"
+              />
+                            <field name="last_triggered_at" readonly="1" />
+                            <field name="last_value" readonly="1" />
+                        </group>
+                    </group>
+                </sheet>
+                <chatter />
+            </form>
+        </field>
+    </record>
+
+    <!-- Action -->
+    <record id="action_queue_job_alert_rule" model="ir.actions.act_window">
+        <field name="name">Alert Rules</field>
+        <field name="res_model">queue.job.alert.rule</field>
+        <field name="view_mode">list,form</field>
+    </record>
+</odoo>

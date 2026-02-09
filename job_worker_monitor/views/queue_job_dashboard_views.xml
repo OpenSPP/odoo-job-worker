@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+  <!-- Dashboard Kanban View -->
+  <record id="view_queue_job_dashboard_kanban" model="ir.ui.view">
+    <field name="name">queue.job.dashboard.kanban</field>
+    <field name="model">queue.job.dashboard</field>
+    <field name="arch" type="xml">
+      <kanban
+        create="false"
+        edit="false"
+        class="o_kanban_dashboard"
+        default_order="sequence"
+        group_create="false"
+        group_delete="false"
+        group_edit="false"
+        groups_draggable="false"
+        records_draggable="false"
+        default_group_by="group_label"
+      >
+        <field name="name" />
+        <field name="value" />
+        <field name="value_number" />
+        <field name="severity" />
+        <field name="subtitle" />
+        <field name="group_label" />
+        <field name="sequence" />
+        <field name="action_domain" />
+        <field name="action_context" />
+        <templates>
+          <t t-name="card">
+            <button
+              type="object"
+              name="action_open_jobs"
+              class="btn p-0 border-0 bg-transparent w-100 text-start"
+            >
+              <!-- Danger (red) -->
+              <div
+                t-if="record.severity.raw_value == 'danger'"
+                class="p-3 border-start border-4 border-danger bg-danger-subtle rounded"
+                style="min-height: 100px;"
+              >
+                <div class="text-muted small mb-1">
+                  <field name="name" />
+                </div>
+                <div class="fs-2 fw-bold text-danger">
+                  <field name="value" />
+                </div>
+                <div
+                  t-if="record.subtitle.raw_value"
+                  class="text-muted small mt-1"
+                >
+                  <field name="subtitle" />
+                </div>
+              </div>
+              <!-- Warning (yellow) -->
+              <div
+                t-elif="record.severity.raw_value == 'warning'"
+                class="p-3 border-start border-4 border-warning bg-warning-subtle rounded"
+                style="min-height: 100px;"
+              >
+                <div class="text-muted small mb-1">
+                  <field name="name" />
+                </div>
+                <div class="fs-2 fw-bold text-warning">
+                  <field name="value" />
+                </div>
+                <div
+                  t-if="record.subtitle.raw_value"
+                  class="text-muted small mt-1"
+                >
+                  <field name="subtitle" />
+                </div>
+              </div>
+              <!-- Info (blue) -->
+              <div
+                t-elif="record.severity.raw_value == 'info'"
+                class="p-3 border-start border-4 border-info bg-info-subtle rounded"
+                style="min-height: 100px;"
+              >
+                <div class="text-muted small mb-1">
+                  <field name="name" />
+                </div>
+                <div class="fs-2 fw-bold text-info">
+                  <field name="value" />
+                </div>
+                <div
+                  t-if="record.subtitle.raw_value"
+                  class="text-muted small mt-1"
+                >
+                  <field name="subtitle" />
+                </div>
+              </div>
+              <!-- Success (green) - default -->
+              <div
+                t-else=""
+                class="p-3 border-start border-4 border-success bg-success-subtle rounded"
+                style="min-height: 100px;"
+              >
+                <div class="text-muted small mb-1">
+                  <field name="name" />
+                </div>
+                <div class="fs-2 fw-bold text-success">
+                  <field name="value" />
+                </div>
+                <div
+                  t-if="record.subtitle.raw_value"
+                  class="text-muted small mt-1"
+                >
+                  <field name="subtitle" />
+                </div>
+              </div>
+            </button>
+          </t>
+        </templates>
+      </kanban>
+    </field>
+  </record>
+
+  <!-- Action -->
+  <record id="action_queue_job_dashboard" model="ir.actions.act_window">
+    <field name="name">Dashboard</field>
+    <field name="res_model">queue.job.dashboard</field>
+    <field name="view_mode">kanban</field>
+  </record>
+</odoo>

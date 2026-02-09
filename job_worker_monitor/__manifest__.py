@@ -1,0 +1,23 @@
+{
+    "name": "Job Worker Monitor",
+    "summary": "Dashboard, metrics, and alerting for the Job Worker queue",
+    "version": "19.0.1.0.0",
+    "category": "Generic Modules",
+    "website": "https://github.com/OpenSPP",
+    "author": "OpenSPP",
+    "license": "LGPL-3",
+    "depends": ["job_worker", "mail"],
+    "data": [
+        "security/security.xml",
+        "security/ir.model.access.csv",
+        "views/queue_job_views.xml",
+        "views/queue_limit_views.xml",
+        "views/queue_job_metric_views.xml",
+        "views/queue_job_alert_rule_views.xml",
+        "views/queue_job_dashboard_views.xml",
+        "views/menus.xml",
+        "data/cron.xml",
+    ],
+    "installable": True,
+    "application": False,
+}

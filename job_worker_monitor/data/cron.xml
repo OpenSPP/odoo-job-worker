@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- Collect 5-minute metric snapshots -->
+    <record id="ir_cron_collect_5min_metrics" model="ir.cron">
+        <field name="name">Queue Job: Collect 5-min Metrics</field>
+        <field name="model_id" ref="model_queue_job_metric" />
+        <field name="state">code</field>
+        <field name="code">model._collect_5min_snapshot()</field>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+        <field name="active">True</field>
+    </record>
+
+    <!-- Roll up hourly metrics -->
+    <record id="ir_cron_rollup_hourly_metrics" model="ir.cron">
+        <field name="name">Queue Job: Roll Up Hourly Metrics</field>
+        <field name="model_id" ref="model_queue_job_metric" />
+        <field name="state">code</field>
+        <field name="code">model._rollup_hourly()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">hours</field>
+        <field name="active">True</field>
+    </record>
+
+    <!-- Roll up daily metrics -->
+    <record id="ir_cron_rollup_daily_metrics" model="ir.cron">
+        <field name="name">Queue Job: Roll Up Daily Metrics</field>
+        <field name="model_id" ref="model_queue_job_metric" />
+        <field name="state">code</field>
+        <field name="code">model._rollup_daily()</field>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="active">True</field>
+    </record>
+
+    <!-- Evaluate alert rules -->
+    <record id="ir_cron_evaluate_alerts" model="ir.cron">
+        <field name="name">Queue Job: Evaluate Alert Rules</field>
+        <field name="model_id" ref="model_queue_job_alert_rule" />
+        <field name="state">code</field>
+        <field name="code">model._evaluate_all_rules()</field>
+        <field name="interval_number">5</field>
+        <field name="interval_type">minutes</field>
+        <field name="active">True</field>
+    </record>
+</odoo>

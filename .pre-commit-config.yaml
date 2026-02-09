@@ -1,0 +1,32 @@
+exclude: ^refs/
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: debug-statements
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+        args: [--unsafe]
+      - id: check-xml
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: local
+    hooks:
+      - id: prettier
+        name: prettier (xml)
+        language: node
+        entry: node scripts/prettier-xml.js
+        types: [xml]
+        additional_dependencies:
+          - "prettier@3.4.2"
+          - "@prettier/plugin-xml@3.4.1"
+        exclude: ^refs/

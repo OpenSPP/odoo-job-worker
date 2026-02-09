@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- Queue Job: users see their own jobs only -->
+    <record id="rule_queue_job_user" model="ir.rule">
+        <field name="name">Queue Job: user sees own jobs</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field name="domain_force">[('user_id', '=', user.id)]</field>
+        <field name="groups" eval="[(4, ref('group_queue_job_user'))]" />
+        <field name="perm_read" eval="True" />
+        <field name="perm_write" eval="True" />
+        <field name="perm_create" eval="False" />
+        <field name="perm_unlink" eval="False" />
+    </record>
+
+    <!-- Queue Job: managers see all jobs -->
+    <record id="rule_queue_job_manager" model="ir.rule">
+        <field name="name">Queue Job: manager sees all</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field name="domain_force">[(1, '=', 1)]</field>
+        <field name="groups" eval="[(4, ref('group_queue_job_manager'))]" />
+    </record>
+
+    <!-- Queue Job: multi-company isolation (global rule, no group) -->
+    <record id="rule_queue_job_company" model="ir.rule">
+        <field name="name">Queue Job: multi-company</field>
+        <field name="model_id" ref="model_queue_job" />
+        <field
+      name="domain_force"
+    >['|', ('company_id', '=', False), ('company_id', 'in', company_ids)]</field>
+    </record>
+
+    <!-- Queue Limit: multi-company not needed (no company_id on queue.limit) -->
+</odoo>

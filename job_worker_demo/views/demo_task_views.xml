@@ -1,0 +1,193 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- SEARCH VIEW -->
+    <record id="view_demo_task_search" model="ir.ui.view">
+        <field name="name">demo.task.search</field>
+        <field name="model">demo.task</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name" />
+                <filter
+          string="Draft"
+          name="draft"
+          domain="[('state', '=', 'draft')]"
+        />
+                <filter
+          string="Queued"
+          name="queued"
+          domain="[('state', '=', 'queued')]"
+        />
+                <filter
+          string="Done"
+          name="done"
+          domain="[('state', '=', 'done')]"
+        />
+                <group>
+                    <filter
+            string="State"
+            name="group_by_state"
+            domain="[]"
+            context="{'group_by': 'state'}"
+          />
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- LIST VIEW -->
+    <record id="view_demo_task_tree" model="ir.ui.view">
+        <field name="name">demo.task.tree</field>
+        <field name="model">demo.task</field>
+        <field name="arch" type="xml">
+            <list
+        string="Demo Tasks"
+        decoration-muted="state == 'done'"
+        decoration-info="state == 'queued'"
+      >
+                <field name="name" />
+                <field
+          name="state"
+          widget="badge"
+          decoration-success="state == 'done'"
+          decoration-info="state == 'queued'"
+          decoration-warning="state == 'draft'"
+        />
+                <field name="completed_at" />
+                <field name="create_date" />
+            </list>
+        </field>
+    </record>
+
+    <!-- FORM VIEW -->
+    <record id="view_demo_task_form" model="ir.ui.view">
+        <field name="name">demo.task.form</field>
+        <field name="model">demo.task</field>
+        <field name="arch" type="xml">
+            <form string="Demo Task">
+                <header>
+                    <button
+            name="action_enqueue_basic"
+            string="Basic Job"
+            type="object"
+            class="oe_highlight"
+            invisible="state != 'draft'"
+          />
+                    <button
+            name="action_enqueue_chain"
+            string="Chain (2 Steps)"
+            type="object"
+            class="oe_highlight"
+            invisible="state != 'draft'"
+          />
+                    <button
+            name="action_create_bulk"
+            string="Kitchen Sink"
+            type="object"
+          />
+                    <button
+            name="action_reset_to_draft"
+            string="Reset to Draft"
+            type="object"
+            invisible="state == 'draft'"
+          />
+                    <field
+            name="state"
+            widget="statusbar"
+            statusbar_visible="draft,queued,done"
+          />
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="name" />
+                        </group>
+                        <group>
+                            <field name="completed_at" />
+                        </group>
+                    </group>
+                    <notebook>
+                        <page string="Execution Log">
+                            <field name="log" readonly="1" />
+                        </page>
+                        <page
+              string="More Actions"
+              invisible="state != 'draft'"
+            >
+                            <group string="Priority">
+                                <div>
+                                    <button
+                    name="action_enqueue_high_priority"
+                    string="High Priority"
+                    type="object"
+                    class="btn-link"
+                  />
+                                    <button
+                    name="action_enqueue_low_priority"
+                    string="Low Priority"
+                    type="object"
+                    class="btn-link"
+                  />
+                                </div>
+                            </group>
+                            <group string="Scheduling">
+                                <div>
+                                    <button
+                    name="action_enqueue_delayed"
+                    string="Delayed (60s)"
+                    type="object"
+                    class="btn-link"
+                  />
+                                    <button
+                    name="action_enqueue_deduplicated"
+                    string="Deduplicated"
+                    type="object"
+                    class="btn-link"
+                  />
+                                    <button
+                    name="action_enqueue_throttled"
+                    string="Throttled Channel"
+                    type="object"
+                    class="btn-link"
+                  />
+                                </div>
+                            </group>
+                            <group string="Failure Scenarios">
+                                <div>
+                                    <button
+                    name="action_enqueue_retry_demo"
+                    string="Retry Demo"
+                    type="object"
+                    class="btn-link"
+                  />
+                                    <button
+                    name="action_enqueue_always_fails"
+                    string="Always Fails"
+                    type="object"
+                    class="btn-link"
+                  />
+                                </div>
+                            </group>
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- SERVER ACTION: Enqueue Selected -->
+    <record id="action_enqueue_selected" model="ir.actions.server">
+        <field name="name">Enqueue Selected</field>
+        <field name="model_id" ref="model_demo_task" />
+        <field name="binding_model_id" ref="model_demo_task" />
+        <field name="binding_view_types">list</field>
+        <field name="state">code</field>
+        <field name="code">records.action_enqueue_selected()</field>
+    </record>
+
+    <!-- ACTION -->
+    <record id="action_demo_task" model="ir.actions.act_window">
+        <field name="name">Demo Tasks</field>
+        <field name="res_model">demo.task</field>
+        <field name="view_mode">list,form</field>
+    </record>
+</odoo>

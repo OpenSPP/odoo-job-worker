@@ -1,0 +1,10 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_queue_job_metric_user,access.queue.job.metric.user,model_queue_job_metric,job_worker.group_queue_job_user,1,0,0,0
+access_queue_job_metric_manager,access.queue.job.metric.manager,model_queue_job_metric,job_worker.group_queue_job_manager,1,1,1,1
+access_queue_job_metric_system,access.queue.job.metric.system,model_queue_job_metric,base.group_system,1,1,1,1
+access_queue_job_alert_rule_user,access.queue.job.alert.rule.user,model_queue_job_alert_rule,job_worker.group_queue_job_user,1,0,0,0
+access_queue_job_alert_rule_manager,access.queue.job.alert.rule.manager,model_queue_job_alert_rule,job_worker.group_queue_job_manager,1,1,1,1
+access_queue_job_alert_rule_system,access.queue.job.alert.rule.system,model_queue_job_alert_rule,base.group_system,1,1,1,1
+access_queue_job_dashboard_user,access.queue.job.dashboard.user,model_queue_job_dashboard,job_worker.group_queue_job_user,1,1,1,1
+access_queue_job_dashboard_manager,access.queue.job.dashboard.manager,model_queue_job_dashboard,job_worker.group_queue_job_manager,1,1,1,1
+access_queue_job_dashboard_system,access.queue.job.dashboard.system,model_queue_job_dashboard,base.group_system,1,1,1,1

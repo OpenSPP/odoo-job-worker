@@ -1,0 +1,21 @@
+{
+    "name": "Job Worker",
+    "summary": "High-performance, SQL-driven 'Pull' architecture queue job engine",
+    "version": "19.0.1.0.0",
+    "category": "Generic Modules",
+    "website": "https://github.com/OpenSPP",
+    "author": "OpenSPP",
+    "license": "LGPL-3",
+    "depends": ["base", "web"],
+    "data": [
+        "security/security.xml",
+        "security/ir.model.access.csv",
+        "security/record_rules.xml",
+        "views/queue_job_views.xml",
+        "views/queue_limit_views.xml",
+        "views/queue_job_actions.xml",
+        "views/menus.xml",
+    ],
+    "installable": True,
+    "application": True,
+}

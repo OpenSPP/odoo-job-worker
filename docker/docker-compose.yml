@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=odoo
+      - POSTGRES_PASSWORD=odoo
+      - POSTGRES_USER=odoo
+    volumes:
+      - odoo-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U odoo"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  odoo:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    env_file:
+      - .env.test
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      # Mount the repo so job_worker/ is importable as an addon
+      - ..:/mnt/extra-addons/odoo-queue-job:ro,z
+      - odoo-data:/var/lib/odoo
+    environment:
+      - HOST=db
+      - USER=odoo
+      - PASSWORD=odoo
+    command: odoo
+
+volumes:
+  odoo-db-data:
+  odoo-data:

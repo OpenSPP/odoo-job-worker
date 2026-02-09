@@ -1,0 +1,345 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <!-- SEARCH VIEW -->
+    <record id="view_queue_job_search" model="ir.ui.view">
+        <field name="name">queue.job.search</field>
+        <field name="model">queue.job</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="func_string" string="Function" />
+                <field name="worker_id" />
+                <field
+          name="channel"
+          filter_domain="[('channel', 'ilike', self)]"
+          string="Channel"
+        />
+                <field name="identity_key" />
+                <filter
+          string="Active Jobs"
+          name="open_jobs"
+          domain="[('state', 'in', ['waiting', 'pending', 'started'])]"
+        />
+                <filter
+          string="Waiting"
+          name="waiting"
+          domain="[('state', '=', 'waiting')]"
+        />
+                <filter
+          string="Pending"
+          name="pending"
+          domain="[('state', '=', 'pending')]"
+        />
+                <filter
+          string="Started"
+          name="started"
+          domain="[('state', '=', 'started')]"
+        />
+                <filter
+          string="Failed"
+          name="failed"
+          domain="[('state', '=', 'failed')]"
+        />
+                <filter
+          string="Done"
+          name="done"
+          domain="[('state', '=', 'done')]"
+        />
+                <filter
+          string="Cancelled"
+          name="cancelled"
+          domain="[('state', '=', 'cancelled')]"
+        />
+                <separator />
+                <filter
+          string="Retried"
+          name="retried"
+          domain="[('attempts', '&gt;', 0)]"
+        />
+                <filter
+          string="With Exception"
+          name="with_exception"
+          domain="[('exc_info', '!=', False)]"
+        />
+                <separator />
+                <filter
+          string="Today"
+          name="today"
+          domain="[('create_date', '&gt;=', context_today().strftime('%%Y-%%m-%%d'))]"
+        />
+                <filter
+          string="Last 24h"
+          name="last_24h"
+          domain="[('create_date', '&gt;=', (context_today() - datetime.timedelta(days=1)).strftime('%%Y-%%m-%%d'))]"
+        />
+                <filter
+          string="Last 7 Days"
+          name="last_7_days"
+          domain="[('create_date', '&gt;=', (context_today() - datetime.timedelta(days=7)).strftime('%%Y-%%m-%%d'))]"
+        />
+                <group>
+                    <filter
+            string="Channel"
+            name="group_by_channel"
+            domain="[]"
+            context="{'group_by': 'channel'}"
+          />
+                    <filter
+            string="State"
+            name="group_by_state"
+            domain="[]"
+            context="{'group_by': 'state'}"
+          />
+                    <filter
+            string="Worker"
+            name="group_by_worker"
+            domain="[]"
+            context="{'group_by': 'worker_id'}"
+          />
+                    <filter
+            string="User"
+            name="group_by_user"
+            domain="[]"
+            context="{'group_by': 'user_id'}"
+          />
+                    <filter
+            string="Job Graph"
+            name="group_by_graph"
+            domain="[]"
+            context="{'group_by': 'graph_uuid'}"
+          />
+                    <filter
+            string="Created Date"
+            name="group_by_create_date"
+            domain="[]"
+            context="{'group_by': 'create_date:day'}"
+          />
+                </group>
+                <searchpanel>
+                    <field name="state" icon="fa-tasks" select="many" />
+                    <field
+            name="channel_id"
+            icon="fa-road"
+            select="many"
+            string="Channel"
+          />
+                    <field
+            name="function_id"
+            icon="fa-cog"
+            select="many"
+            string="Function"
+          />
+                    <field
+            name="duration_bucket"
+            icon="fa-clock-o"
+            select="many"
+            string="Duration"
+          />
+                </searchpanel>
+            </search>
+        </field>
+    </record>
+
+    <!-- LIST VIEW -->
+    <record id="view_queue_job_tree" model="ir.ui.view">
+        <field name="name">queue.job.tree</field>
+        <field name="model">queue.job</field>
+        <field name="arch" type="xml">
+            <list
+        string="Jobs"
+        create="false"
+        delete="false"
+        decoration-danger="state == 'failed'"
+        decoration-success="state == 'started'"
+        decoration-muted="state in ('done', 'cancelled')"
+      >
+                <field name="func_string" string="Function" />
+                <field name="channel" />
+                <field
+          name="state"
+          widget="badge"
+          decoration-danger="state == 'failed'"
+          decoration-success="state == 'done'"
+          decoration-info="state == 'started'"
+          decoration-warning="state == 'pending'"
+          decoration-muted="state == 'waiting'"
+        />
+                <field name="create_date" string="Created" />
+                <field name="attempts" string="Retries" />
+                <field name="started_at" optional="show" />
+                <field name="duration" optional="show" />
+                <field name="priority" optional="hide" />
+                <field name="max_retries" optional="hide" />
+                <field name="scheduled_at" optional="hide" />
+                <field name="user_id" optional="hide" />
+                <field name="completed_at" optional="hide" />
+                <field name="worker_id" optional="hide" />
+                <field name="heartbeat" optional="hide" />
+                <field name="identity_key" optional="hide" />
+                <field name="graph_uuid" optional="hide" />
+                <field name="timeout" optional="hide" />
+            </list>
+        </field>
+    </record>
+
+    <!-- FORM VIEW -->
+    <record id="view_queue_job_form" model="ir.ui.view">
+        <field name="name">queue.job.form</field>
+        <field name="model">queue.job</field>
+        <field name="arch" type="xml">
+            <form string="Job" create="false" delete="false">
+                <header>
+                    <button
+            name="run_now"
+            string="Run Now"
+            type="object"
+            class="oe_highlight"
+            invisible="state in ('done', 'started')"
+            groups="job_worker.group_queue_job_manager,base.group_system"
+          />
+                    <button
+            name="button_requeue"
+            string="Requeue"
+            type="object"
+            invisible="state not in ('failed', 'done')"
+          />
+                    <button
+            name="button_set_to_done"
+            string="Set to Done"
+            type="object"
+            invisible="state == 'done'"
+            groups="job_worker.group_queue_job_manager,base.group_system"
+          />
+                    <button
+            name="button_set_to_failed"
+            string="Set to Failed"
+            type="object"
+            invisible="state in ('done', 'failed')"
+            groups="job_worker.group_queue_job_manager,base.group_system"
+          />
+                    <button
+            name="button_cancelled"
+            string="Cancel"
+            type="object"
+            invisible="state in ('done', 'failed', 'cancelled')"
+            groups="job_worker.group_queue_job_manager,base.group_system"
+          />
+                    <button
+            name="open_related_action"
+            string="Related Record"
+            type="object"
+            class="oe_highlight"
+          />
+                    <field
+            name="state"
+            widget="statusbar"
+            statusbar_visible="waiting,pending,started,done,failed,cancelled"
+          />
+                </header>
+                <sheet>
+                    <group>
+                        <group>
+                            <field name="name" readonly="1" />
+                            <field name="func_string" readonly="1" />
+                            <field name="uuid" readonly="1" />
+                            <field name="priority" readonly="1" />
+                            <field name="scheduled_at" readonly="1" />
+                            <field name="channel" readonly="1" />
+                            <field name="identity_key" readonly="1" />
+                        </group>
+                        <group>
+                            <field name="attempts" readonly="1" />
+                            <field name="max_retries" readonly="1" />
+                            <field name="timeout" readonly="1" />
+                            <field name="started_at" readonly="1" />
+                            <field name="completed_at" readonly="1" />
+                            <field name="duration" readonly="1" />
+                            <field
+                name="cancelled_at"
+                readonly="1"
+                invisible="state != 'cancelled'"
+              />
+                            <field name="user_id" readonly="1" />
+                            <field name="worker_id" readonly="1" />
+                            <field name="heartbeat" readonly="1" />
+                            <field
+                name="company_id"
+                groups="base.group_multi_company"
+                readonly="1"
+              />
+                            <field name="create_date" readonly="1" />
+                            <field name="write_date" readonly="1" />
+                        </group>
+                    </group>
+                    <group
+            string="Dependencies"
+            invisible="not parent_id and not child_ids"
+          >
+                        <field name="parent_id" readonly="1" />
+                        <field name="child_ids" readonly="1">
+                            <list>
+                                <field name="state" widget="badge" />
+                                <field name="channel" />
+                                <field name="create_date" />
+                            </list>
+                        </field>
+                        <field name="graph_uuid" readonly="1" />
+                    </group>
+                    <notebook>
+                        <page string="Payload">
+                            <field
+                name="payload_display"
+                widget="ace"
+                options="{'mode': 'json'}"
+                readonly="1"
+              />
+                        </page>
+                        <page string="Result" invisible="not result">
+                            <field
+                name="result_display"
+                widget="ace"
+                options="{'mode': 'json'}"
+                readonly="1"
+              />
+                        </page>
+                        <page string="Exception Info" invisible="not exc_info">
+                            <field name="exc_info" readonly="1" />
+                        </page>
+                    </notebook>
+                </sheet>
+            </form>
+        </field>
+    </record>
+
+    <!-- PIVOT VIEW -->
+    <record id="view_queue_job_pivot" model="ir.ui.view">
+        <field name="name">queue.job.pivot</field>
+        <field name="model">queue.job</field>
+        <field name="arch" type="xml">
+            <pivot string="Jobs Analysis">
+                <field name="channel" type="row" />
+                <field name="state" type="col" />
+                <field name="duration" type="measure" />
+            </pivot>
+        </field>
+    </record>
+
+    <!-- GRAPH VIEW -->
+    <record id="view_queue_job_graph" model="ir.ui.view">
+        <field name="name">queue.job.graph</field>
+        <field name="model">queue.job</field>
+        <field name="arch" type="xml">
+            <graph string="Jobs Analysis" type="bar">
+                <field name="channel" />
+                <field name="state" />
+            </graph>
+        </field>
+    </record>
+
+    <!-- ACTION -->
+    <record id="action_queue_job" model="ir.actions.act_window">
+        <field name="name">Jobs</field>
+        <field name="res_model">queue.job</field>
+        <field name="view_mode">list,form,pivot,graph</field>
+        <field name="context">{'search_default_open_jobs': 1}</field>
+    </record>
+</odoo>

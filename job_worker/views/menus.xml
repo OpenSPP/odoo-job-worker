@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <menuitem
+    id="menu_queue_job_root"
+    name="Queue Jobs"
+    web_icon="job_worker,static/description/icon.png"
+    groups="job_worker.group_queue_job_user,base.group_system"
+  />
+
+    <menuitem
+    id="menu_queue_job_jobs"
+    name="Jobs"
+    parent="menu_queue_job_root"
+    action="action_queue_job"
+    sequence="10"
+    groups="job_worker.group_queue_job_user,base.group_system"
+  />
+
+    <menuitem
+    id="menu_queue_job_config"
+    name="Configuration"
+    parent="menu_queue_job_root"
+    sequence="20"
+    groups="job_worker.group_queue_job_manager,base.group_system"
+  />
+    <menuitem
+    id="menu_queue_limit"
+    name="Channel Limits"
+    parent="menu_queue_job_config"
+    action="action_queue_limit"
+    sequence="10"
+    groups="job_worker.group_queue_job_manager,base.group_system"
+  />
+</odoo>

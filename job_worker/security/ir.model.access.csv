@@ -1,0 +1,13 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_queue_job_user,access.queue.job.user,model_queue_job,group_queue_job_user,1,1,0,0
+access_queue_job_manager,access.queue.job.manager,model_queue_job,group_queue_job_manager,1,1,1,1
+access_queue_job_system,access.queue.job.system,model_queue_job,base.group_system,1,1,1,1
+access_queue_limit_user,access.queue.limit.user,model_queue_limit,group_queue_job_user,1,0,0,0
+access_queue_limit_manager,access.queue.limit.manager,model_queue_limit,group_queue_job_manager,1,1,1,1
+access_queue_limit_system,access.queue.limit.system,model_queue_limit,base.group_system,1,1,1,1
+access_queue_job_channel_user,access.queue.job.channel.user,model_queue_job_channel,group_queue_job_user,1,0,0,0
+access_queue_job_channel_manager,access.queue.job.channel.manager,model_queue_job_channel,group_queue_job_manager,1,1,1,1
+access_queue_job_channel_system,access.queue.job.channel.system,model_queue_job_channel,base.group_system,1,1,1,1
+access_queue_job_function_user,access.queue.job.function.user,model_queue_job_function,group_queue_job_user,1,0,0,0
+access_queue_job_function_manager,access.queue.job.function.manager,model_queue_job_function,group_queue_job_manager,1,1,1,1
+access_queue_job_function_system,access.queue.job.function.system,model_queue_job_function,base.group_system,1,1,1,1

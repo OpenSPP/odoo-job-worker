@@ -1,0 +1,86 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ODOO_VERSION: "19.0"
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  test:
+    name: Test ${{ matrix.module }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - job_worker
+          - job_worker_monitor
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: test_ci
+          POSTGRES_USER: odoo
+          POSTGRES_PASSWORD: odoo
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U odoo"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build Odoo image
+        run: |
+          docker build \
+            -f docker/Dockerfile \
+            -t odoo-test \
+            .
+
+      - name: Run tests for ${{ matrix.module }}
+        run: |
+          TEST_DB="test_${{ matrix.module }}_${GITHUB_RUN_ID}"
+          docker run --rm \
+            --network host \
+            -e HOST=localhost \
+            -e USER=odoo \
+            -e PASSWORD=odoo \
+            -v "${{ github.workspace }}:/mnt/extra-addons/odoo-queue-job:ro" \
+            odoo-test \
+            odoo \
+              -d "${TEST_DB}" \
+              --workers 0 \
+              --test-enable \
+              --test-tags /${{ matrix.module }} \
+              --addons-path=/opt/odoo/odoo/addons,/opt/odoo/odoo/odoo/addons,/mnt/extra-addons,/mnt/extra-addons/odoo-queue-job \
+              --stop-after-init \
+              -i ${{ matrix.module }} \
+              --log-level=test \
+              2>&1 | tee test-output.log
+
+      - name: Check test results
+        if: always()
+        run: |
+          if grep -q "failed, [1-9].*error(s)" test-output.log 2>/dev/null; then
+            echo "::error::Tests had errors"
+            exit 1
+          fi
+          if grep -q "[1-9][0-9]* failed" test-output.log 2>/dev/null; then
+            echo "::error::Tests had failures"
+            exit 1
+          fi
+          echo "All tests passed"

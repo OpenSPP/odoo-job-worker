@@ -1,0 +1,9 @@
+/* Table styling */
+.md-typeset table:not([class]) th {
+    min-width: 6rem;
+}
+
+/* Mermaid diagram centering */
+.md-typeset .mermaid {
+    text-align: center;
+}

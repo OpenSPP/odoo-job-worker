@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<odoo>
+    <record id="sequence_demo_task" model="ir.sequence">
+        <field name="name">Demo Task</field>
+        <field name="code">demo.task</field>
+        <field name="prefix">DT/</field>
+        <field name="padding">4</field>
+    </record>
+</odoo>

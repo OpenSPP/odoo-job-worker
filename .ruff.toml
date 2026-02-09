@@ -1,0 +1,37 @@
+target-version = "py311"
+fix = true
+
+[lint]
+extend-select = [
+    "B",    # flake8-bugbear
+    "C90",  # mccabe
+    "E501", # line too long
+    "I",    # isort
+    "UP",   # pyupgrade
+]
+exclude = ["refs/*", "setup/*"]
+
+[format]
+exclude = ["refs/*", "setup/*"]
+
+[lint.per-file-ignores]
+"__init__.py" = ["F401", "I001"]
+"__manifest__.py" = ["B018"]
+
+[lint.isort]
+section-order = [
+    "future",
+    "standard-library",
+    "third-party",
+    "odoo",
+    "odoo-addons",
+    "first-party",
+    "local-folder",
+]
+
+[lint.isort.sections]
+"odoo" = ["odoo"]
+"odoo-addons" = ["odoo.addons"]
+
+[lint.mccabe]
+max-complexity = 16
