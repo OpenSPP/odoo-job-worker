@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: [19.0]
   pull_request:
-    branches: [main]
+    branches: [19.0]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -59,14 +59,14 @@ jobs:
             -e HOST=localhost \
             -e USER=odoo \
             -e PASSWORD=odoo \
-            -v "${{ github.workspace }}:/mnt/extra-addons/odoo-queue-job:ro" \
+            -v "${{ github.workspace }}:/mnt/extra-addons/odoo-job-worker:ro" \
             odoo-test \
             odoo \
               -d "${TEST_DB}" \
               --workers 0 \
               --test-enable \
               --test-tags /${{ matrix.module }} \
-              --addons-path=/opt/odoo/odoo/addons,/opt/odoo/odoo/odoo/addons,/mnt/extra-addons,/mnt/extra-addons/odoo-queue-job \
+              --addons-path=/opt/odoo/odoo/addons,/opt/odoo/odoo/odoo/addons,/mnt/extra-addons,/mnt/extra-addons/odoo-job-worker \
               --stop-after-init \
               -i ${{ matrix.module }} \
               --log-level=test \

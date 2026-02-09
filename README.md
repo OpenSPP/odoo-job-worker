@@ -165,7 +165,7 @@ bash docker/run_tests.sh
 
 ## Bug Tracker
 
-Bugs are tracked on [GitHub Issues](https://github.com/OpenSPP/odoo-queue-job/issues).
+Bugs are tracked on [GitHub Issues](https://github.com/OpenSPP/odoo-job-worker/issues).
 
 ## Credits
 

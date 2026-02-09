@@ -2,14 +2,14 @@ name: Docs
 
 on:
   push:
-    branches: [main]
+    branches: [19.0]
     paths:
       - "docs/**"
       - "mkdocs.yml"
       - "pyproject.toml"
       - ".github/workflows/docs.yml"
   pull_request:
-    branches: [main]
+    branches: [19.0]
     paths:
       - "docs/**"
       - "mkdocs.yml"
@@ -46,14 +46,14 @@ jobs:
         run: uv run mkdocs build --strict
 
       - name: Upload artifact
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/19.0'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
     name: Deploy to GitHub Pages
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/19.0'
     needs: build
     runs-on: ubuntu-latest
     permissions:

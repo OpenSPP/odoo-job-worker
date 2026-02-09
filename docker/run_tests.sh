@@ -5,7 +5,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 MODULES="${1:-job_worker,job_worker_monitor}"
-ADDONS_PATH="/opt/odoo/odoo/addons,/opt/odoo/odoo/odoo/addons,/mnt/extra-addons,/mnt/extra-addons/odoo-queue-job"
+ADDONS_PATH="/opt/odoo/odoo/addons,/opt/odoo/odoo/odoo/addons,/mnt/extra-addons,/mnt/extra-addons/odoo-job-worker"
 
 echo "Starting Postgres..."
 docker compose up -d db

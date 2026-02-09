@@ -2,9 +2,9 @@ name: Lint
 
 on:
   push:
-    branches: [main]
+    branches: [19.0]
   pull_request:
-    branches: [main]
+    branches: [19.0]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

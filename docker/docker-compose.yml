@@ -24,7 +24,7 @@ services:
         condition: service_healthy
     volumes:
       # Mount the repo so job_worker/ is importable as an addon
-      - ..:/mnt/extra-addons/odoo-queue-job:ro,z
+      - ..:/mnt/extra-addons/odoo-job-worker:ro,z
       - odoo-data:/var/lib/odoo
     environment:
       - HOST=db
