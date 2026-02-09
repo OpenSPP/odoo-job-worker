@@ -1,17 +1,15 @@
 #!/usr/bin/env node
 /**
- * Wrapper that sets NODE_PATH so prettier can find plugins installed
- * in the pre-commit virtual environment's node_modules.
+ * Wrapper that runs prettier with the XML plugin.
+ * Resolves the plugin relative to prettier's own location so it works
+ * both locally and in pre-commit's isolated node environment.
  */
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const nodeModules = path.resolve(
-  path.dirname(process.execPath),
-  "..",
-  "lib",
-  "node_modules",
-);
+// Find node_modules by locating prettier's package directory
+const prettierDir = path.dirname(require.resolve("prettier/package.json"));
+const nodeModules = path.dirname(prettierDir);
 const pluginPath = path.join(
   nodeModules,
   "@prettier",
