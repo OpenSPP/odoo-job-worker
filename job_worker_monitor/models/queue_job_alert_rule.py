@@ -132,6 +132,7 @@ class QueueJobAlertRule(models.Model):
         else:
             return 0.0
 
+        self.env["queue.job"].flush_model()
         self.env.cr.execute(query, params)
         result = self.env.cr.fetchone()
         return float(result[0]) if result and result[0] is not None else 0.0

@@ -25,6 +25,7 @@ class QueueLimit(models.Model):
         if not self.ids:
             return
 
+        self.env["queue.job"].flush_model()
         self.env.cr.execute(
             """
             SELECT channel,

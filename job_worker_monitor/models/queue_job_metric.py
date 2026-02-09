@@ -47,6 +47,9 @@ class QueueJobMetric(models.Model):
         now = fields.Datetime.now()
         window_start = now - timedelta(minutes=5)
 
+        # Flush pending ORM writes so raw SQL sees current state
+        self.env["queue.job"].flush_model()
+
         # Completed/failed job stats per channel in the last 5 minutes
         self.env.cr.execute(
             """

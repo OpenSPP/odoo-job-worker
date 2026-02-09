@@ -194,14 +194,14 @@ class TestConcurrencyAndRecovery(TransactionCase):
         """Verify retry logic handles transient serialization errors."""
         call_count = 0
 
+        class _SerializationError(OperationalError):
+            pgcode = "40001"
+
         def failing_operation():
             nonlocal call_count
             call_count += 1
             if call_count < 3:
-                # Simulate serialization failure
-                err = OperationalError()
-                err.pgcode = "40001"
-                raise err
+                raise _SerializationError("serialization failure")
             return "success"
 
         # Should retry and eventually succeed
