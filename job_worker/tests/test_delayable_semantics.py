@@ -208,3 +208,179 @@ class TestDelayableSemantics(TransactionCase):
         d = partner.delayable().write({"name": "Type Check Done"})
         self.assertIsInstance(group(d), DelayableGroup)
         self.assertIsInstance(chain(d), DelayableChain)
+
+
+@tagged("post_install", "-at_install")
+class TestChainGraphEdgeCases(TransactionCase):
+    """Probe job chain/graph edge cases."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_child_fails_when_parent_fails_via_run_now(self):
+        """When parent fails via run_now(), children should be cascaded
+        to failed state too."""
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="method_does_not_exist",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            max_retries=3,
+            channel="chain_retry",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "child"}],
+            kwargs={},
+            parent_id=parent.id,
+            channel="chain_retry",
+        )
+        self.assertEqual(child.state, "waiting")
+
+        try:
+            parent.run_now()
+        except AttributeError:
+            pass
+        parent.invalidate_recordset()
+        child.invalidate_recordset()
+        # run_now() always marks as failed (no retry logic)
+        self.assertEqual(parent.state, "failed")
+        self.assertEqual(child.state, "failed")
+
+    def test_orphaned_child_when_parent_cancelled(self):
+        """If parent is cancelled, children should remain in waiting state
+        (cancelling doesn't cascade)."""
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "parent cancel"}],
+            kwargs={},
+            channel="cancel_chain",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "child cancel"}],
+            kwargs={},
+            parent_id=parent.id,
+            channel="cancel_chain",
+        )
+        self.assertEqual(child.state, "waiting")
+
+        parent.button_cancelled()
+        child.invalidate_recordset()
+        # Cancellation does not cascade — child remains orphaned in waiting
+        self.assertEqual(child.state, "waiting")
+
+    def test_deep_chain_does_not_stackoverflow(self):
+        """A deeply nested chain should not cause a stack overflow
+        during execution."""
+        depth = 50
+        jobs = []
+        for i in range(depth):
+            parent_id = jobs[-1].id if jobs else None
+            job = self.Job.enqueue(
+                model_name="res.partner",
+                method_name="create",
+                record_ids=[],
+                args=[{"name": f"chain_{i}"}],
+                kwargs={},
+                parent_id=parent_id,
+                channel="deep_chain",
+            )
+            jobs.append(job)
+
+        # First job should be pending, all others waiting
+        self.assertEqual(jobs[0].state, "pending")
+        for job in jobs[1:]:
+            self.assertEqual(job.state, "waiting")
+
+        # Execute first job
+        jobs[0].run_now()
+        jobs[0].invalidate_recordset()
+        jobs[1].invalidate_recordset()
+        self.assertEqual(jobs[0].state, "done")
+        self.assertEqual(jobs[1].state, "pending")
+
+    def test_child_with_no_parent_starts_pending(self):
+        """A job created with parent_id=None starts as pending."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "no parent"}],
+            kwargs={},
+            parent_id=None,
+            channel="no_parent",
+        )
+        self.assertEqual(job.state, "pending")
+
+    def test_multiple_children_all_released_on_parent_done(self):
+        """All waiting children should be released when parent completes."""
+        partner = self.env["res.partner"].create({"name": "Multi Child Parent"})
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "Parent Done"}],
+            kwargs={},
+            channel="multi_child",
+        )
+        children = []
+        for i in range(5):
+            child = self.Job.enqueue(
+                model_name="res.partner",
+                method_name="create",
+                record_ids=[],
+                args=[{"name": f"child_{i}"}],
+                kwargs={},
+                parent_id=parent.id,
+                channel="multi_child",
+            )
+            children.append(child)
+
+        parent.run_now()
+        for child in children:
+            child.invalidate_recordset()
+            self.assertEqual(child.state, "pending")
+
+    def test_multiple_children_all_failed_on_parent_failure(self):
+        """All waiting children should fail when parent fails via run_now().
+        run_now() always marks failures as terminal regardless of max_retries."""
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="method_does_not_exist",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            max_retries=5,
+            channel="multi_child_fail",
+        )
+        children = []
+        for i in range(3):
+            child = self.Job.enqueue(
+                model_name="res.partner",
+                method_name="create",
+                record_ids=[],
+                args=[{"name": f"fail_child_{i}"}],
+                kwargs={},
+                parent_id=parent.id,
+                channel="multi_child_fail",
+            )
+            children.append(child)
+
+        try:
+            parent.run_now()
+        except AttributeError:
+            pass
+        parent.invalidate_recordset()
+        self.assertEqual(parent.state, "failed")
+        for child in children:
+            child.invalidate_recordset()
+            self.assertEqual(child.state, "failed")

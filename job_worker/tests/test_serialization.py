@@ -162,6 +162,120 @@ class TestJobSerialization(TransactionCase):
         with self.assertRaisesRegex(ValueError, "Record\\(s\\).*not found"):
             json.loads(raw, cls=JobDecoder, env=self.env)
 
+    def test_deeply_nested_args_serialize(self):
+        """Deeply nested argument structures should serialize properly."""
+        nested = {"level": 0}
+        current = nested
+        for i in range(1, 50):
+            current["child"] = {"level": i}
+            current = current["child"]
+
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "nested", "data": nested}],
+            kwargs={},
+            channel="nested",
+        )
+        payload = job.payload
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        self.assertIn("data", payload["args"][0])
+
+    def test_unicode_in_args(self):
+        """Unicode characters in arguments should be handled."""
+        name = "テスト パートナー 🎉 مرحبا"
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": name}],
+            kwargs={},
+            channel="unicode",
+        )
+        job.run_now()
+        self.assertEqual(job.state, "done")
+        created = self.env["res.partner"].search([("name", "=", name)], limit=1)
+        self.assertTrue(created)
+
+    def test_empty_args_and_kwargs(self):
+        """Jobs with no args or kwargs should work."""
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="flush_recordset",
+            record_ids=[],
+            args=None,
+            kwargs=None,
+            channel="empty_args",
+        )
+        job.run_now()
+        self.assertEqual(job.state, "done")
+
+    def test_result_serialization_with_none(self):
+        """A None result should serialize to None."""
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="flush_recordset",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="none_result",
+        )
+        result = job._serialize_result(None)
+        self.assertIsNone(result)
+
+    def test_result_serialization_with_recordset(self):
+        """A recordset result should be serialized via JobEncoder."""
+        partner = self.env["res.partner"].create({"name": "Result RS"})
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "Result RS 2"}],
+            kwargs={},
+            channel="rs_result",
+        )
+        result = job._serialize_result(partner)
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result.get("__type__"), "odoo_recordset")
+
+    def test_result_serialization_completely_unserializable(self):
+        """A completely unserializable result should fallback to repr."""
+
+        class Unserializable:
+            def __repr__(self):
+                return "<Unserializable object>"
+
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "Unserializable"}],
+            kwargs={},
+            channel="unserializable",
+        )
+        result = job._serialize_result(Unserializable())
+        self.assertIn("__repr__", result)
+
+    def test_result_serialization_repr_raises(self):
+        """A result whose repr() raises should still not crash."""
+
+        class BadRepr:
+            def __repr__(self):
+                raise RuntimeError("repr fails")
+
+        job = self.env["queue.job"].enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "BadRepr"}],
+            kwargs={},
+            channel="bad_repr",
+        )
+        result = job._serialize_result(BadRepr())
+        self.assertEqual(result, {"__repr__": "<unserializable>"})
+
     def test_run_now_marks_failed_when_target_records_are_missing(self):
         partner = self.env["res.partner"].create({"name": "Run Now Missing"})
         job = self.env["queue.job"].enqueue(

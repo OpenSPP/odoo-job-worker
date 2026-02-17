@@ -1,5 +1,6 @@
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from odoo import SUPERUSER_ID, api, fields
 from odoo.tests.common import TransactionCase, tagged
@@ -339,3 +340,219 @@ class TestAutovacuum(TransactionCase):
         self.Job._gc_old_jobs()
 
         self.assertFalse(old_job.exists())
+
+
+@tagged("post_install", "-at_install")
+class TestGarbageCollectionEdgeCases(TransactionCase):
+    """Probe garbage collection / autovacuum edge cases."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_gc_does_not_delete_pending_jobs(self):
+        """GC should never delete pending jobs regardless of age."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "old pending"}],
+            kwargs={},
+            channel="gc",
+        )
+        # Force an old create_date via SQL
+        self.env.cr.execute(
+            "UPDATE queue_job SET create_date = NOW()"
+            " - INTERVAL '365 days' WHERE id = %s",
+            (job.id,),
+        )
+        self.env.cr.flush()
+        self.Job._gc_old_jobs()
+        self.assertTrue(self.Job.browse(job.id).exists())
+
+    def test_gc_does_not_delete_started_jobs(self):
+        """GC should never delete started (running) jobs."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "old started"}],
+            kwargs={},
+            channel="gc_started",
+        )
+        job.write({"state": "started"})
+        self.env.cr.execute(
+            "UPDATE queue_job SET create_date = NOW()"
+            " - INTERVAL '365 days' WHERE id = %s",
+            (job.id,),
+        )
+        self.env.cr.flush()
+        self.Job._gc_old_jobs()
+        self.assertTrue(self.Job.browse(job.id).exists())
+
+    def test_gc_does_not_delete_waiting_jobs(self):
+        """GC should never delete waiting jobs."""
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "gc parent"}],
+            kwargs={},
+            channel="gc_waiting",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "gc child"}],
+            kwargs={},
+            parent_id=parent.id,
+            channel="gc_waiting",
+        )
+        self.assertEqual(child.state, "waiting")
+        self.env.cr.execute(
+            "UPDATE queue_job SET create_date = NOW()"
+            " - INTERVAL '365 days' WHERE id = %s",
+            (child.id,),
+        )
+        self.env.cr.flush()
+        self.Job._gc_old_jobs()
+        self.assertTrue(self.Job.browse(child.id).exists())
+
+    def test_gc_deletes_old_done_jobs(self):
+        """GC should delete done jobs older than retention."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "old done"}],
+            kwargs={},
+            channel="gc_done",
+        )
+        old_time = fields.Datetime.now() - timedelta(days=60)
+        job.write({"state": "done", "completed_at": old_time})
+        self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_deletes_old_failed_jobs(self):
+        """GC should delete failed jobs older than retention."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "old failed"}],
+            kwargs={},
+            channel="gc_failed",
+        )
+        old_time = fields.Datetime.now() - timedelta(days=60)
+        job.write({"state": "failed", "completed_at": old_time})
+        self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_deletes_old_cancelled_jobs(self):
+        """GC should delete cancelled jobs older than retention."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "old cancelled"}],
+            kwargs={},
+            channel="gc_cancelled",
+        )
+        old_time = fields.Datetime.now() - timedelta(days=60)
+        job.write({"state": "cancelled", "cancelled_at": old_time})
+        self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_respects_retention_parameter(self):
+        """GC should respect the configured retention days."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "retention test"}],
+            kwargs={},
+            channel="gc_retention",
+        )
+        # Set completed 10 days ago
+        old_time = fields.Datetime.now() - timedelta(days=10)
+        job.write({"state": "done", "completed_at": old_time})
+
+        # Set retention to 365 days - job should survive
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "365"
+        )
+        self.Job._gc_old_jobs()
+        self.assertTrue(self.Job.browse(job.id).exists())
+
+        # Set retention to 5 days - job should be deleted
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "5"
+        )
+        self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_zero_retention_deletes_all_terminal_jobs(self):
+        """GC with 0 retention days should delete all completed jobs,
+        including those completed at exactly now.
+        Freeze time to ensure completed_at == cutoff, validating the <= fix."""
+        fixed = datetime(2026, 6, 15, 12, 0, 0)
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "zero retention"}],
+            kwargs={},
+            channel="gc_zero",
+        )
+        job.write({"state": "done", "completed_at": fixed})
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "0"
+        )
+        with patch("odoo.fields.Datetime.now", return_value=fixed):
+            self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_negative_retention_deletes_recent_jobs(self):
+        """Negative retention days means cutoff is in the future,
+        which will delete even recently completed jobs."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "recent job"}],
+            kwargs={},
+            channel="gc_neg_retention",
+        )
+        job.write({"state": "done", "completed_at": fields.Datetime.now()})
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "-1"
+        )
+        self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
+    def test_gc_done_job_without_completed_at_survives(self):
+        """A done job with NULL completed_at should not be deleted
+        by GC since the SQL comparison with NULL is always false."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "null completed"}],
+            kwargs={},
+            channel="gc_null_completed",
+        )
+        # Force state to done without setting completed_at
+        self.env.cr.execute(
+            "UPDATE queue_job SET state = 'done', completed_at = NULL WHERE id = %s",
+            (job.id,),
+        )
+        self.env.cr.flush()
+        job.invalidate_recordset()
+
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "0"
+        )
+        self.Job._gc_old_jobs()
+        # NULL completed_at means the SQL <= comparison never matches
+        self.assertTrue(self.Job.browse(job.id).exists())

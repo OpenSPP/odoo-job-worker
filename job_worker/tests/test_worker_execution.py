@@ -6,6 +6,7 @@ from odoo import SUPERUSER_ID, api, fields
 from odoo.tests.common import TransactionCase, tagged
 
 from ..cli.worker import QueueWorker
+from ..exception import RetryableJobError
 
 
 @tagged("post_install", "-at_install")
@@ -561,3 +562,178 @@ class TestWorkerExecution(TransactionCase):
             self.assertEqual(
                 env["queue.job"].browse(foreign.id).heartbeat, old_heartbeat
             )
+
+
+@tagged("post_install", "-at_install")
+class TestWorkerExecutionEdgeCases(TransactionCase):
+    """Probe worker execution paths for adversarial scenarios."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    @contextmanager
+    def _external_env(self):
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            yield cr, env
+
+    def test_worker_execute_job_with_deleted_target_record(self):
+        """Worker should handle executing a job whose target record
+        was deleted between enqueue and execution."""
+        with self._external_env() as (cr, env):
+            env["queue.job"].search([("state", "in", ["pending", "started"])]).write(
+                {"state": "done", "heartbeat": False, "worker_id": False}
+            )
+            partner = env["res.partner"].create({"name": "Will Be Deleted"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "After Delete"}],
+                kwargs={},
+                max_retries=1,
+                channel="deleted",
+            )
+            partner.unlink()
+            cr.commit()
+
+            worker = QueueWorker(cr.dbname)
+            worker.execute_job(cr, job.id)
+
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            # Should retry then fail
+            self.assertIn(refreshed.state, ("pending", "failed"))
+            self.assertIn("not found", refreshed.exc_info or "")
+
+    def test_worker_execute_job_with_zero_timeout(self):
+        """Worker should treat timeout=0 as no timeout."""
+        with self._external_env() as (cr, env):
+            env["queue.job"].search([("state", "in", ["pending", "started"])]).write(
+                {"state": "done", "heartbeat": False, "worker_id": False}
+            )
+            partner = env["res.partner"].create({"name": "Zero Timeout"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "Zero Timeout After"}],
+                kwargs={},
+                timeout=0,
+                channel="zero_timeout",
+            )
+            worker = QueueWorker(cr.dbname)
+            worker.execute_job(cr, job.id)
+
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            self.assertEqual(refreshed.state, "done")
+
+    def test_worker_handle_exception_retryable_with_both_flags(self):
+        """RetryableJobError with ignore_retry=True and explicit seconds."""
+        with self._external_env() as (cr, env):
+            worker = QueueWorker(cr.dbname)
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=[],
+                args=[{"name": "both flags"}],
+                kwargs={},
+                max_retries=1,
+                channel="both_flags",
+            )
+            exc = RetryableJobError("transient", seconds=30, ignore_retry=True)
+            worker.handle_exception(job, exc=exc)
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            self.assertEqual(refreshed.state, "pending")
+            self.assertEqual(refreshed.attempts, 0)
+            diff = abs(
+                (
+                    fields.Datetime.to_datetime(refreshed.scheduled_at)
+                    - fields.Datetime.now()
+                ).total_seconds()
+                - 30
+            )
+            self.assertLess(diff, 5)
+
+    def test_worker_handle_exception_non_retryable_clears_ownership(self):
+        """Terminal failure should clear worker_id and heartbeat."""
+        with self._external_env() as (cr, env):
+            worker = QueueWorker(cr.dbname)
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=[],
+                args=[{"name": "clear ownership"}],
+                kwargs={},
+                max_retries=1,
+                channel="clear_own",
+            )
+            job.write(
+                {
+                    "attempts": 1,
+                    "worker_id": "test-worker",
+                    "heartbeat": fields.Datetime.now(),
+                }
+            )
+            worker.handle_exception(job, exc=Exception("boom"))
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            self.assertEqual(refreshed.state, "failed")
+            self.assertFalse(refreshed.worker_id)
+            self.assertFalse(refreshed.heartbeat)
+
+
+@tagged("post_install", "-at_install")
+class TestRunNowStateGuard(TransactionCase):
+    """Probe run_now() behavior when called on jobs in unexpected states."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_run_now_on_done_job_re_executes(self):
+        """run_now() has no state guard -- calling it on a done job
+        will re-execute the payload and overwrite the state."""
+        partner = self.env["res.partner"].create({"name": "Before"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "After"}],
+            kwargs={},
+            channel="done_rerun",
+        )
+        # First run
+        fixed_first = datetime(2026, 1, 1, 12, 0, 0)
+        with patch("odoo.fields.Datetime.now", return_value=fixed_first):
+            job.run_now()
+        self.assertEqual(job.state, "done")
+
+        # Second run with a different timestamp
+        fixed_second = datetime(2026, 1, 1, 13, 0, 0)
+        with patch("odoo.fields.Datetime.now", return_value=fixed_second):
+            job.run_now()
+        self.assertEqual(job.state, "done")
+        # completed_at was updated to the second run's time
+        self.assertEqual(fields.Datetime.to_datetime(job.completed_at), fixed_second)
+
+    def test_run_now_on_cancelled_job_re_executes(self):
+        """run_now() on a cancelled job will re-execute (no guard)."""
+        partner = self.env["res.partner"].create({"name": "Cancelled"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "Revived"}],
+            kwargs={},
+            channel="cancelled_rerun",
+        )
+        job.button_cancelled()
+        self.assertEqual(job.state, "cancelled")
+
+        # run_now re-executes regardless of state
+        job.run_now()
+        self.assertEqual(job.state, "done")

@@ -55,3 +55,71 @@ class TestOpenRelatedAction(TransactionCase):
         )
         with self.assertRaises(ValueError):
             (job1 | job2).open_related_action()
+
+
+@tagged("post_install", "-at_install")
+class TestRelatedActionEdgeCases(TransactionCase):
+    """Probe the open_related_action method for edge cases."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_open_related_action_single_record(self):
+        """open_related_action with one record should return form view."""
+        partner = self.env["res.partner"].create({"name": "Related Action"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "After"}],
+            kwargs={},
+            channel="related",
+        )
+        action = job.open_related_action()
+        self.assertEqual(action["res_model"], "res.partner")
+        self.assertEqual(action["res_id"], partner.id)
+        self.assertEqual(action["view_mode"], "form")
+
+    def test_open_related_action_multiple_records(self):
+        """open_related_action with multiple records should return list view."""
+        p1 = self.env["res.partner"].create({"name": "Related 1"})
+        p2 = self.env["res.partner"].create({"name": "Related 2"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=[p1.id, p2.id],
+            args=[{"name": "After"}],
+            kwargs={},
+            channel="related_multi",
+        )
+        action = job.open_related_action()
+        self.assertEqual(action["view_mode"], "list,form")
+        self.assertEqual(action["domain"], [("id", "in", [p1.id, p2.id])])
+
+    def test_open_related_action_no_record_ids(self):
+        """open_related_action with no record IDs should return False."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "No IDs"}],
+            kwargs={},
+            channel="related_empty",
+        )
+        result = job.open_related_action()
+        self.assertFalse(result)
+
+    def test_open_related_action_with_empty_payload(self):
+        """open_related_action when payload is an empty dict should return False."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "Empty Payload"}],
+            kwargs={},
+            channel="related_empty_payload",
+        )
+        job.write({"payload": {}})
+        result = job.open_related_action()
+        self.assertFalse(result)

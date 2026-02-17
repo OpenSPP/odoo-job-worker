@@ -421,3 +421,437 @@ class TestQueueJobEnqueue(TransactionCase):
 
         self.assertNotEqual(job1.id, job2.id)
         self.assertEqual(job2.state, "pending")
+
+
+@tagged("post_install", "-at_install")
+class TestPayloadValidation(TransactionCase):
+    """Probe payload handling for dangerous or malformed inputs."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_nonexistent_model_raises_valueerror_at_enqueue(self):
+        """enqueue() raises ValueError when model_name doesn't exist."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="nonexistent.model.xyz",
+                method_name="do_stuff",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="bad_model",
+            )
+        self.assertIn("nonexistent.model.xyz", str(ctx.exception))
+
+    def test_nonexistent_method_in_payload_raises_on_run(self):
+        """A payload referencing a non-existent method should fail on execution.
+        run_now() marks the job as failed and re-raises the exception."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="absolutely_nonexistent_method_xyz",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="bad_method",
+        )
+        try:
+            job.run_now()
+            self.fail("run_now() should raise when method does not exist")
+        except AttributeError:
+            pass
+        job.invalidate_recordset()
+        self.assertEqual(job.state, "failed")
+        self.assertIn("AttributeError", job.exc_info or "")
+
+    def test_private_method_in_payload(self):
+        """A payload targeting a private method (underscore prefix) should
+        still execute -- the system does not filter method names."""
+        partner = self.env["res.partner"].create({"name": "Private Method"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="_compute_display_name",
+            record_ids=partner.ids,
+            args=[],
+            kwargs={},
+            channel="private",
+        )
+        # This is an observation test: private methods are callable.
+        # If the system should block private methods, this test documents
+        # that it currently does NOT.
+        job.run_now()
+        self.assertEqual(job.state, "done")
+
+    def test_empty_model_raises_valueerror_at_enqueue(self):
+        """enqueue() raises ValueError when model_name is empty."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="",
+                method_name="",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="empty",
+            )
+        self.assertIn("does not exist", str(ctx.exception))
+
+    def test_payload_with_nonexistent_record_ids(self):
+        """Payload with record IDs that don't exist should fail on run_now."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=[999999999],
+            args=[{"name": "ghost"}],
+            kwargs={},
+            channel="ghost_ids",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            job.run_now()
+        self.assertIn("not found", str(ctx.exception))
+
+    def test_payload_with_mixed_existing_and_missing_ids(self):
+        """Payload with some valid and some invalid IDs should fail."""
+        partner = self.env["res.partner"].create({"name": "Exists"})
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=[partner.id, 999999999],
+            args=[{"name": "mixed"}],
+            kwargs={},
+            channel="mixed_ids",
+        )
+        with self.assertRaises(ValueError) as ctx:
+            job.run_now()
+        self.assertIn("999999999", str(ctx.exception))
+
+    def test_payload_with_empty_record_ids_list(self):
+        """Empty record_ids should call the method on the model class."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "Created Without IDs"}],
+            kwargs={},
+            channel="empty_ids",
+        )
+        job.run_now()
+        self.assertEqual(job.state, "done")
+        created = self.env["res.partner"].search(
+            [("name", "=", "Created Without IDs")], limit=1
+        )
+        self.assertTrue(created)
+
+    def test_payload_with_none_record_ids(self):
+        """None record_ids should be treated like empty."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=None,
+            args=[{"name": "None IDs Partner"}],
+            kwargs={},
+            channel="none_ids",
+        )
+        job.run_now()
+        self.assertEqual(job.state, "done")
+
+
+@tagged("post_install", "-at_install")
+class TestEtaNormalizationEdgeCases(TransactionCase):
+    """Probe eta/scheduled_at normalization for edge cases."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_eta_as_timedelta(self):
+        """ETA as a timedelta should be resolved relative to now."""
+        from datetime import timedelta as td
+
+        before = fields.Datetime.now()
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "timedelta eta"}],
+            kwargs={},
+            eta=td(hours=1),
+            channel="eta_td",
+        )
+        scheduled = fields.Datetime.to_datetime(job.scheduled_at)
+        self.assertGreaterEqual(scheduled, before + td(minutes=59))
+
+    def test_eta_as_zero(self):
+        """ETA as 0 seconds should schedule approximately now."""
+        before = fields.Datetime.now()
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "zero eta"}],
+            kwargs={},
+            eta=0,
+            channel="eta_zero",
+        )
+        scheduled = fields.Datetime.to_datetime(job.scheduled_at)
+        diff = abs((scheduled - before).total_seconds())
+        self.assertLess(diff, 5)
+
+    def test_eta_as_float(self):
+        """ETA as a float (fractional seconds) should work."""
+        before = fields.Datetime.now()
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "float eta"}],
+            kwargs={},
+            eta=0.5,
+            channel="eta_float",
+        )
+        scheduled = fields.Datetime.to_datetime(job.scheduled_at)
+        diff = abs((scheduled - before).total_seconds())
+        self.assertLess(diff, 5)
+
+    def test_normalize_eta_with_none(self):
+        """_normalize_eta with None should return None."""
+        result = self.Job._normalize_eta(None)
+        self.assertIsNone(result)
+
+
+@tagged("post_install", "-at_install")
+class TestEnqueueEdgeCases(TransactionCase):
+    """Probe enqueue API for boundary conditions."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_enqueue_with_zero_priority(self):
+        """Priority 0 should be valid and highest priority."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "priority 0"}],
+            kwargs={},
+            priority=0,
+            channel="priority",
+        )
+        self.assertEqual(job.priority, 0)
+
+    def test_enqueue_with_negative_priority(self):
+        """Negative priority should be accepted (higher than 0)."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "priority negative"}],
+            kwargs={},
+            priority=-100,
+            channel="neg_priority",
+        )
+        self.assertEqual(job.priority, -100)
+
+    def test_enqueue_with_very_large_priority(self):
+        """Very large priority should be accepted (lowest priority)."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "priority huge"}],
+            kwargs={},
+            priority=999999999,
+            channel="huge_priority",
+        )
+        self.assertEqual(job.priority, 999999999)
+
+    def test_enqueue_with_negative_timeout(self):
+        """Negative timeout should be stored (timeout=0 means no timeout,
+        but negative is ambiguous)."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "negative timeout"}],
+            kwargs={},
+            timeout=-1,
+            channel="neg_timeout",
+        )
+        self.assertEqual(job.timeout, -1)
+
+    def test_enqueue_with_very_long_channel_name(self):
+        """Very long channel name should be accepted."""
+        long_channel = "c" * 5000
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "long channel"}],
+            kwargs={},
+            channel=long_channel,
+        )
+        self.assertEqual(job.channel, long_channel)
+
+    def test_enqueue_with_special_characters_in_channel(self):
+        """Special characters in channel name should be accepted."""
+        channel = "root/sub-channel.v2 (test) [special]"
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "special channel"}],
+            kwargs={},
+            channel=channel,
+        )
+        self.assertEqual(job.channel, channel)
+
+    def test_enqueue_stores_user_and_company(self):
+        """Enqueued jobs should capture the current user and company."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "user check"}],
+            kwargs={},
+            channel="user",
+        )
+        self.assertEqual(job.user_id.id, self.env.user.id)
+        self.assertEqual(job.company_id.id, self.env.company.id)
+
+    def test_enqueue_uuid_is_unique(self):
+        """Each enqueued job should get a unique UUID."""
+        job1 = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "uuid 1"}],
+            kwargs={},
+            channel="uuid",
+        )
+        job2 = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "uuid 2"}],
+            kwargs={},
+            channel="uuid",
+        )
+        self.assertNotEqual(job1.uuid, job2.uuid)
+        self.assertTrue(job1.uuid)
+        self.assertTrue(job2.uuid)
+
+
+@tagged("post_install", "-at_install")
+class TestEnqueueValidation(TransactionCase):
+    """Probe enqueue validation and edge cases not covered elsewhere."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_conflicting_eta_and_scheduled_at_raises(self):
+        """Providing both eta and scheduled_at with different values
+        should raise ValueError."""
+        now = fields.Datetime.now()
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="create",
+                record_ids=[],
+                args=[{"name": "conflict"}],
+                kwargs={},
+                eta=now + timedelta(hours=1),
+                scheduled_at=now - timedelta(hours=1),
+                channel="conflict_eta",
+            )
+        self.assertIn("eta", str(ctx.exception).lower())
+
+    def test_eta_as_negative_timedelta(self):
+        """ETA as a negative timedelta should schedule in the past."""
+        before = fields.Datetime.now()
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "negative td eta"}],
+            kwargs={},
+            eta=timedelta(hours=-1),
+            channel="neg_td_eta",
+        )
+        scheduled = fields.Datetime.to_datetime(job.scheduled_at)
+        self.assertLess(scheduled, before)
+
+
+@tagged("post_install", "-at_install")
+class TestMethodNameValidation(TransactionCase):
+    """Verify that dangerous method names are blocked at enqueue time."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_dunder_init_blocked(self):
+        """__init__ should be blocked from job queue execution."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__init__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="dunder",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_dunder_del_blocked(self):
+        """__del__ should be blocked from job queue execution."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__del__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="dunder",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_dunder_getattr_blocked(self):
+        """__getattr__ should be blocked from job queue execution."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__getattr__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="dunder",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_single_underscore_allowed(self):
+        """Single-underscore private methods should still be allowed
+        (they are legitimate Odoo methods like _compute_*)."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="_compute_display_name",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="single_underscore",
+        )
+        self.assertTrue(job)
+        self.assertEqual(job.state, "pending")
+
+    def test_regular_method_allowed(self):
+        """Regular public methods should be allowed."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "allowed"}],
+            kwargs={},
+            channel="regular_method",
+        )
+        self.assertTrue(job)
+        self.assertEqual(job.state, "pending")
