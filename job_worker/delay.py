@@ -95,7 +95,7 @@ class Delayable:
         return self
 
     def __getattr__(self, name):
-        if name.startswith("_"):
+        if name.startswith("__"):
             raise AttributeError(name)
         self._job_method = name
         return self._store_args
