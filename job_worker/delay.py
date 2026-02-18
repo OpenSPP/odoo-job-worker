@@ -47,6 +47,7 @@ class Delayable:
         self._next_delayables = []
         self._graph_uuid = None
         self._parent_job_id = None
+        self._dependency_job_ids = None
 
     def __del__(self):
         try:
@@ -94,7 +95,7 @@ class Delayable:
         return self
 
     def __getattr__(self, name):
-        if name.startswith("_"):
+        if name.startswith("__"):
             raise AttributeError(name)
         self._job_method = name
         return self._store_args
@@ -145,6 +146,7 @@ class Delayable:
             parent_id=self._parent_job_id,
             graph_uuid=graph_uuid,
             timeout=self.timeout if self.timeout is not None else DEFAULT_TIMEOUT,
+            dependency_job_ids=self._dependency_job_ids,
         )
         for next_delayable in self._next_delayables:
             next_delayable._graph_uuid = graph_uuid
@@ -207,12 +209,14 @@ class DelayableGroup:
 
     def delay(self):
         graph_uuid = str(_uuid.uuid4())
+        member_jobs = []
         for delayable in self._delayables:
             delayable._graph_uuid = graph_uuid
-            delayable.delay()
+            job = delayable.delay()
+            member_jobs.append(job.id)
         for next_delayable in self._next_delayables:
             next_delayable._graph_uuid = graph_uuid
-            # No parent_id — group dependents have multiple "parents"
+            next_delayable._dependency_job_ids = list(member_jobs)
             next_delayable.delay()
 
 

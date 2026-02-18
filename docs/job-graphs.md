@@ -134,10 +134,37 @@ record.delayable().do_work().on_done(
 ).delay()
 ```
 
-!!! note "Current limitation"
-    `DelayableChain` expects `Delayable` steps. Putting a `group()` inside `chain()`,
-    or using `DelayableGroup.on_done()`, does not create a wait-for-all dependency
-    barrier.
+### Group Callbacks
+
+`group().on_done()` creates a wait-for-all barrier. The callback job starts in `waiting`
+state and transitions to `pending` only after every group member completes:
+
+```python
+from odoo.addons.job_worker.delay import group
+
+group(
+    batch1.delayable().do_export(),
+    batch2.delayable().do_export(),
+    batch3.delayable().do_export(),
+).on_done(
+    record.delayable().finalize_export(),
+).delay()
+```
+
+```mermaid
+graph LR
+    A[Batch 1] --> D[Finalize]
+    B[Batch 2] --> D
+    C[Batch 3] --> D
+```
+
+The barrier uses `dependency_job_ids` (a JSON list of parent job IDs) and
+`pending_dependency_count` (decremented atomically as each parent completes).
+If any group member fails permanently, the callback is also marked `failed`.
+
+!!! note "Chain limitation"
+    `DelayableChain` expects `Delayable` steps. Putting a `group()` inside `chain()`
+    does not create a wait-for-all dependency barrier.
 
 ## How It Works
 
@@ -158,5 +185,8 @@ stateDiagram-v2
 
 - Jobs in a graph share a `graph_uuid` (auto-generated UUIDv4)
 - Chain dependencies use `parent_id` — each job points to its predecessor
+- Group barriers use `dependency_job_ids` — a JSON list of parent job IDs
 - When a parent job transitions to `done`, its children move from `waiting` to `pending`
+- For group barriers, `pending_dependency_count` is decremented for each completing parent;
+  the callback moves to `pending` when the count reaches 0
 - When a parent job transitions to `failed`, its children also move to `failed`
