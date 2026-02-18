@@ -158,8 +158,8 @@ class TestDelayableSemantics(TransactionCase):
         self.assertTrue(jobs[0].graph_uuid)
         self.assertEqual(jobs[0].graph_uuid, jobs[1].graph_uuid)
 
-    def test_group_on_done_does_not_set_parent_id(self):
-        """Group dependents have no parent_id (Many2one limitation)."""
+    def test_group_on_done_creates_barrier(self):
+        """Group on_done callback uses dependency_job_ids for multi-parent barrier."""
         a = self.env["res.partner"].create({"name": "GrpDoneA"})
         b = self.env["res.partner"].create({"name": "GrpDoneB"})
         c = self.env["res.partner"].create({"name": "GrpDoneC"})
@@ -170,13 +170,101 @@ class TestDelayableSemantics(TransactionCase):
         ).on_done(c.delayable().write({"name": "GrpDoneC done"})).delay()
 
         jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
-        # The last job (c) is the dependent — should NOT have parent_id
-        dependent = jobs[2]
-        self.assertFalse(dependent.parent_id)
-        # But all share graph_uuid
-        self.assertTrue(jobs[0].graph_uuid)
-        self.assertEqual(jobs[0].graph_uuid, jobs[1].graph_uuid)
-        self.assertEqual(jobs[0].graph_uuid, jobs[2].graph_uuid)
+        member_a, member_b, callback = jobs[0], jobs[1], jobs[2]
+
+        # Callback starts in waiting state with dependency tracking
+        self.assertEqual(callback.state, "waiting")
+        self.assertFalse(callback.parent_id)
+        self.assertIn(member_a.id, callback.dependency_job_ids)
+        self.assertIn(member_b.id, callback.dependency_job_ids)
+        self.assertEqual(callback.pending_dependency_count, 2)
+
+        # All share graph_uuid
+        self.assertTrue(member_a.graph_uuid)
+        self.assertEqual(member_a.graph_uuid, member_b.graph_uuid)
+        self.assertEqual(member_a.graph_uuid, callback.graph_uuid)
+
+        # Members start in pending state
+        self.assertEqual(member_a.state, "pending")
+        self.assertEqual(member_b.state, "pending")
+
+    def test_group_on_done_barrier_released_when_all_done(self):
+        """Callback transitions to pending only after all group members complete."""
+        a = self.env["res.partner"].create({"name": "BarrierA"})
+        b = self.env["res.partner"].create({"name": "BarrierB"})
+        c = self.env["res.partner"].create({"name": "BarrierC"})
+
+        group(
+            a.delayable().write({"name": "BarrierA done"}),
+            b.delayable().write({"name": "BarrierB done"}),
+        ).on_done(c.delayable().write({"name": "BarrierC done"})).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
+        member_a, member_b, callback = jobs[0], jobs[1], jobs[2]
+
+        # Complete first member — callback should stay waiting
+        member_a.run_now()
+        callback.invalidate_recordset()
+        self.assertEqual(callback.state, "waiting")
+        self.assertEqual(callback.pending_dependency_count, 1)
+
+        # Complete second member — callback should transition to pending
+        member_b.run_now()
+        callback.invalidate_recordset()
+        self.assertEqual(callback.state, "pending")
+        self.assertEqual(callback.pending_dependency_count, 0)
+
+    def test_group_on_done_cascade_failure(self):
+        """Callback fails when any group member fails permanently."""
+        a = self.env["res.partner"].create({"name": "FailA"})
+        b = self.env["res.partner"].create({"name": "FailB"})
+        c = self.env["res.partner"].create({"name": "FailC"})
+
+        group(
+            a.delayable().method_does_not_exist(),
+            b.delayable().write({"name": "FailB done"}),
+        ).on_done(c.delayable().write({"name": "FailC done"})).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
+        member_a, _member_b, callback = jobs[0], jobs[1], jobs[2]
+
+        # Fail the first member
+        try:
+            member_a.run_now()
+        except AttributeError:
+            pass
+
+        member_a.invalidate_recordset()
+        callback.invalidate_recordset()
+        self.assertEqual(member_a.state, "failed")
+        self.assertEqual(callback.state, "failed")
+        self.assertIn("Parent job", callback.exc_info)
+
+    def test_group_on_done_button_set_to_done(self):
+        """button_set_to_done releases multi-parent dependents."""
+        a = self.env["res.partner"].create({"name": "BtnA"})
+        b = self.env["res.partner"].create({"name": "BtnB"})
+        c = self.env["res.partner"].create({"name": "BtnC"})
+
+        group(
+            a.delayable().write({"name": "BtnA done"}),
+            b.delayable().write({"name": "BtnB done"}),
+        ).on_done(c.delayable().write({"name": "BtnC done"})).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
+        member_a, member_b, callback = jobs[0], jobs[1], jobs[2]
+
+        # Manually complete first member — callback stays waiting
+        member_a.button_set_to_done()
+        callback.invalidate_recordset()
+        self.assertEqual(callback.state, "waiting")
+        self.assertEqual(callback.pending_dependency_count, 1)
+
+        # Manually complete second member — callback transitions to pending
+        member_b.button_set_to_done()
+        callback.invalidate_recordset()
+        self.assertEqual(callback.state, "pending")
+        self.assertEqual(callback.pending_dependency_count, 0)
 
     def test_child_ids_inverse(self):
         """Parent's child_ids contains the dependent."""

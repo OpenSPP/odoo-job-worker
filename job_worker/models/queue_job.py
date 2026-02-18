@@ -183,6 +183,19 @@ class QueueJob(models.Model):
         index=True,
         help="Groups related jobs that were enqueued together.",
     )
+    dependency_job_ids = fields.Json(
+        string="Dependency Job IDs",
+        readonly=True,
+        help="List of job IDs that must all complete before this job runs. "
+        "Used by group().on_done() for multi-parent barriers.",
+    )
+    pending_dependency_count = fields.Integer(
+        string="Pending Dependencies",
+        default=0,
+        readonly=True,
+        help="Number of parent jobs that must still complete. "
+        "Job transitions from waiting to pending when this reaches 0.",
+    )
 
     payload_display = fields.Text(
         string="Payload (formatted)",
@@ -271,6 +284,11 @@ class QueueJob(models.Model):
         self.env.cr.execute("""
             CREATE INDEX IF NOT EXISTS queue_job_channel_completed_idx
             ON queue_job (channel, completed_at) WHERE completed_at IS NOT NULL
+        """)
+        self.env.cr.execute("""
+            CREATE INDEX IF NOT EXISTS queue_job_dependency_ids_gin
+            ON queue_job USING gin (dependency_job_ids jsonb_path_ops)
+            WHERE dependency_job_ids IS NOT NULL
         """)
 
     def _compute_display_name(self):
@@ -509,6 +527,41 @@ class QueueJob(models.Model):
     def _search_date_cancelled(self, operator, value):
         return [("cancelled_at", operator, value)]
 
+    def _release_dependents(self):
+        """Release multi-parent dependents (group barriers) when this job completes."""
+        for job in self:
+            if not job.graph_uuid:
+                continue
+            waiting_deps = self.search(
+                [
+                    ("graph_uuid", "=", job.graph_uuid),
+                    ("state", "=", "waiting"),
+                    ("dependency_job_ids", "!=", False),
+                ]
+            )
+            for dep in waiting_deps:
+                if job.id in (dep.dependency_job_ids or []):
+                    dep.pending_dependency_count -= 1
+                    if dep.pending_dependency_count <= 0:
+                        dep.state = "pending"
+
+    def _fail_dependents(self):
+        """Cascade failure to multi-parent dependents."""
+        for job in self:
+            if not job.graph_uuid:
+                continue
+            waiting_deps = self.search(
+                [
+                    ("graph_uuid", "=", job.graph_uuid),
+                    ("state", "=", "waiting"),
+                    ("dependency_job_ids", "!=", False),
+                ]
+            )
+            for dep in waiting_deps:
+                if job.id in (dep.dependency_job_ids or []):
+                    dep.state = "failed"
+                    dep.exc_info = f"Parent job {job.id} failed"
+
     def button_requeue(self):
         for job in self:
             if job.identity_key:
@@ -548,6 +601,7 @@ class QueueJob(models.Model):
                     now - fields.Datetime.to_datetime(job.started_at)
                 ).total_seconds()
             job.write(vals)
+        self._release_dependents()
 
     def button_set_to_failed(self):
         now = fields.Datetime.now()
@@ -558,6 +612,11 @@ class QueueJob(models.Model):
                     now - fields.Datetime.to_datetime(job.started_at)
                 ).total_seconds()
             job.write(vals)
+            # Cascade failure to waiting children
+            for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
+                child.state = "failed"
+                child.exc_info = f"Parent job {job.id} failed"
+        self._fail_dependents()
 
     def button_cancelled(self):
         now = fields.Datetime.now()
@@ -625,6 +684,8 @@ class QueueJob(models.Model):
                 # Release waiting children
                 for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
                     child.state = "pending"
+                # Release multi-parent dependents (group barriers)
+                job._release_dependents()
             except RetryableJobError as err:
                 job.exc_info = traceback.format_exc()
                 if not err.ignore_retry:
@@ -650,6 +711,8 @@ class QueueJob(models.Model):
                 for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
                     child.state = "failed"
                     child.exc_info = f"Parent job {job.id} failed"
+                # Cascade failure to multi-parent dependents (group barriers)
+                job._fail_dependents()
                 raise
 
     @api.model
@@ -680,6 +743,7 @@ class QueueJob(models.Model):
         parent_id=None,
         graph_uuid=None,
         timeout=None,
+        dependency_job_ids=None,
     ):
         """Public API to enqueue a job with queue_job-compatible options."""
         from .job_serialization import JobEncoder
@@ -728,7 +792,7 @@ class QueueJob(models.Model):
 
         vals = {
             "payload": payload_serialized,
-            "state": "waiting" if parent_id else "pending",
+            "state": "waiting" if (parent_id or dependency_job_ids) else "pending",
             "priority": priority,
             "channel": channel,
             "max_retries": max_retries,
@@ -739,6 +803,10 @@ class QueueJob(models.Model):
             "parent_id": parent_id,
             "graph_uuid": graph_uuid,
             "name": description or False,
+            "dependency_job_ids": dependency_job_ids,
+            "pending_dependency_count": (
+                len(dependency_job_ids) if dependency_job_ids else 0
+            ),
         }
         store_values = self.env[model_name]._job_store_values(vals)
         vals.update(store_values)

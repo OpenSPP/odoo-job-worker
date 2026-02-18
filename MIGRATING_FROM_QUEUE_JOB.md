@@ -294,9 +294,13 @@ main.delay()
 `parent_id` and `graph_uuid` fields on the job record. Child jobs start in
 `waiting` state and move to `pending` when their parent completes.
 
-**Current limitation:** `chain()` sequencing is enforced for `Delayable`
-steps. `group().on_done(...)` and `chain(..., group(...), ...)` do not create
-a wait-for-all dependency barrier in the current implementation.
+**Group callbacks:** `group().on_done(callback)` creates a wait-for-all
+barrier — the callback starts in `waiting` state and transitions to `pending`
+only after every group member completes. If any member fails permanently, the
+callback also fails.
+
+**Chain limitation:** `chain()` sequencing is enforced for `Delayable` steps.
+Putting a `group()` inside `chain()` does not create a wait-for-all barrier.
 
 ## 8. identity_key
 

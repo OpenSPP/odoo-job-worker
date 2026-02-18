@@ -381,14 +381,14 @@ class QueueWorker:
         """
         with read_committed_cursor(self.db) as cr:
             cr.execute(
-                "SELECT state, attempts, max_retries, started_at"
+                "SELECT state, attempts, max_retries, started_at, graph_uuid"
                 " FROM queue_job WHERE id = %s",
                 (job_id,),
             )
             row = cr.fetchone()
             if not row or row[0] != "started":
                 return
-            _state, attempts, max_retries, started_at = row
+            _state, attempts, max_retries, started_at, graph_uuid = row
             attempts += 1
             exc_info = f"TimeoutJobError: Job exceeded {timeout}s timeout"
 
@@ -440,6 +440,25 @@ class QueueWorker:
                     " WHERE parent_id = %s AND state = 'waiting'",
                     (f"Parent job {job_id} failed (timeout)", job_id),
                 )
+                # Cascade failure to multi-parent dependents (group barriers)
+                if graph_uuid:
+                    cr.execute(
+                        """
+                        UPDATE queue_job
+                        SET state = 'failed',
+                            exc_info = %s,
+                            write_date = NOW()
+                        WHERE graph_uuid = %s
+                          AND state = 'waiting'
+                          AND dependency_job_ids IS NOT NULL
+                          AND dependency_job_ids @> (%s)::jsonb
+                        """,
+                        (
+                            f"Parent job {job_id} failed (timeout)",
+                            graph_uuid,
+                            json.dumps([job_id]),
+                        ),
+                    )
                 _logger.error(
                     "Job %s timed out permanently after %s attempts.",
                     job_id,
@@ -595,6 +614,28 @@ class QueueWorker:
                         lambda c: c.state == "waiting"
                     ):
                         child.state = "pending"
+                    # Flush ORM writes so raw SQL sees done_job.state = "done"
+                    env_done.flush_all()
+                    # Release multi-parent dependents (group barriers)
+                    if done_job.graph_uuid:
+                        env_done.cr.execute(
+                            """
+                            UPDATE queue_job
+                            SET pending_dependency_count =
+                                    pending_dependency_count - 1,
+                                state = CASE
+                                    WHEN pending_dependency_count - 1 <= 0
+                                        THEN 'pending'
+                                    ELSE state
+                                END,
+                                write_date = NOW()
+                            WHERE graph_uuid = %s
+                              AND state = 'waiting'
+                              AND dependency_job_ids IS NOT NULL
+                              AND dependency_job_ids @> (%s)::jsonb
+                            """,
+                            (done_job.graph_uuid, json.dumps([job_id])),
+                        )
                     env_done.cr.execute("NOTIFY queue_job_wake_up")
                     env_done.cr.commit()
 
@@ -690,6 +731,19 @@ class QueueWorker:
             for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
                 child.state = "failed"
                 child.exc_info = f"Parent job {job.id} failed"
+            # Cascade failure to multi-parent dependents (group barriers)
+            if job.graph_uuid:
+                dep_jobs = job.env["queue.job"].search(
+                    [
+                        ("graph_uuid", "=", job.graph_uuid),
+                        ("state", "=", "waiting"),
+                        ("dependency_job_ids", "!=", False),
+                    ]
+                )
+                for dep in dep_jobs:
+                    if job.id in (dep.dependency_job_ids or []):
+                        dep.state = "failed"
+                        dep.exc_info = f"Parent job {job.id} failed"
             _logger.error("Job %s failed permanently.\n%s", job.id, tb)
 
         job.env.cr.commit()
