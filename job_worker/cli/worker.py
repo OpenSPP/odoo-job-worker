@@ -733,17 +733,23 @@ class QueueWorker:
                 child.exc_info = f"Parent job {job.id} failed"
             # Cascade failure to multi-parent dependents (group barriers)
             if job.graph_uuid:
-                dep_jobs = job.env["queue.job"].search(
-                    [
-                        ("graph_uuid", "=", job.graph_uuid),
-                        ("state", "=", "waiting"),
-                        ("dependency_job_ids", "!=", False),
-                    ]
+                job.env.cr.execute(
+                    """
+                    UPDATE queue_job
+                    SET state = 'failed',
+                        exc_info = %s,
+                        write_date = NOW()
+                    WHERE graph_uuid = %s
+                      AND state = 'waiting'
+                      AND dependency_job_ids IS NOT NULL
+                      AND dependency_job_ids @> (%s)::jsonb
+                    """,
+                    (
+                        f"Parent job {job.id} failed",
+                        job.graph_uuid,
+                        json.dumps([job.id]),
+                    ),
                 )
-                for dep in dep_jobs:
-                    if job.id in (dep.dependency_job_ids or []):
-                        dep.state = "failed"
-                        dep.exc_info = f"Parent job {job.id} failed"
             _logger.error("Job %s failed permanently.\n%s", job.id, tb)
 
         job.env.cr.commit()

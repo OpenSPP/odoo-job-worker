@@ -541,38 +541,49 @@ class QueueJob(models.Model):
 
     def _release_dependents(self):
         """Release multi-parent dependents (group barriers) when this job completes."""
+        self.env.flush_all()
         for job in self:
             if not job.graph_uuid:
                 continue
-            waiting_deps = self.search(
-                [
-                    ("graph_uuid", "=", job.graph_uuid),
-                    ("state", "=", "waiting"),
-                    ("dependency_job_ids", "!=", False),
-                ]
+            self.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET pending_dependency_count = pending_dependency_count - 1,
+                    state = CASE
+                        WHEN pending_dependency_count - 1 <= 0
+                            THEN 'pending'
+                        ELSE state
+                    END,
+                    write_date = NOW()
+                WHERE graph_uuid = %s
+                  AND state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                """,
+                (job.graph_uuid, json.dumps([job.id])),
             )
-            for dep in waiting_deps:
-                if job.id in (dep.dependency_job_ids or []):
-                    dep.pending_dependency_count -= 1
-                    if dep.pending_dependency_count <= 0:
-                        dep.state = "pending"
+        self.env.invalidate_all()
 
     def _fail_dependents(self):
         """Cascade failure to multi-parent dependents."""
+        self.env.flush_all()
         for job in self:
             if not job.graph_uuid:
                 continue
-            waiting_deps = self.search(
-                [
-                    ("graph_uuid", "=", job.graph_uuid),
-                    ("state", "=", "waiting"),
-                    ("dependency_job_ids", "!=", False),
-                ]
+            self.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET state = 'failed',
+                    exc_info = %s,
+                    write_date = NOW()
+                WHERE graph_uuid = %s
+                  AND state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                """,
+                (f"Parent job {job.id} failed", job.graph_uuid, json.dumps([job.id])),
             )
-            for dep in waiting_deps:
-                if job.id in (dep.dependency_job_ids or []):
-                    dep.state = "failed"
-                    dep.exc_info = f"Parent job {job.id} failed"
+        self.env.invalidate_all()
 
     def button_requeue(self):
         for job in self:
