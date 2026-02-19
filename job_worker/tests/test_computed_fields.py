@@ -291,3 +291,32 @@ class TestComputedFieldResilience(TransactionCase):
         job.invalidate_recordset()
         # Should not raise; renders the JSON string
         self.assertTrue(job.result_display)
+
+    def test_payload_fields_with_json_string_payload(self):
+        """_compute_payload_fields should gracefully handle a JSON string
+        payload (not a dict) without crashing on json.loads.
+        Uses ORM write to trigger stored computed field recomputation."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "resilience"}],
+            kwargs={},
+            channel="resilience_payload_fields",
+        )
+        # ORM write triggers recomputation of stored computed fields
+        job.write({"payload": "just a string"})
+        self.assertFalse(job.model_name)
+        self.assertFalse(job.method_name)
+        self.assertFalse(job.func_string)
+
+    def test_display_name_with_empty_string_payload(self):
+        """_compute_display_name should handle an empty string payload
+        stored as a JSON string ('"" ')."""
+        job = self._create_job_with_sql_payload(json.dumps(""))
+        self.assertIn(f"Job #{job.id}", job.display_name)
+
+    def test_payload_display_with_json_number(self):
+        """_compute_payload_display should handle a JSON number payload."""
+        job = self._create_job_with_sql_payload(json.dumps(42))
+        self.assertIn("42", job.payload_display)

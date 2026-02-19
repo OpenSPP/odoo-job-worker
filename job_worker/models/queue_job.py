@@ -295,7 +295,10 @@ class QueueJob(models.Model):
         for record in self:
             payload = record.payload
             if isinstance(payload, str):
-                payload = json.loads(payload)
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
             if isinstance(payload, dict):
                 model = payload.get("model", "?")
                 method = payload.get("method", "?")
@@ -312,7 +315,10 @@ class QueueJob(models.Model):
             if record.result:
                 result = record.result
                 if isinstance(result, str):
-                    result = json.loads(result)
+                    try:
+                        result = json.loads(result)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 record.result_display = json.dumps(result, indent=2)
             else:
                 record.result_display = ""
@@ -344,7 +350,10 @@ class QueueJob(models.Model):
             if record.payload:
                 payload = record.payload
                 if isinstance(payload, str):
-                    payload = json.loads(payload)
+                    try:
+                        payload = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 record.payload_display = json.dumps(payload, indent=2)
             else:
                 record.payload_display = ""
@@ -354,7 +363,10 @@ class QueueJob(models.Model):
         for record in self:
             payload = record.payload
             if isinstance(payload, str):
-                payload = json.loads(payload)
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
             if isinstance(payload, dict):
                 model = payload.get("model", "")
                 method = payload.get("method", "")
@@ -529,38 +541,49 @@ class QueueJob(models.Model):
 
     def _release_dependents(self):
         """Release multi-parent dependents (group barriers) when this job completes."""
+        self.env.flush_all()
         for job in self:
             if not job.graph_uuid:
                 continue
-            waiting_deps = self.search(
-                [
-                    ("graph_uuid", "=", job.graph_uuid),
-                    ("state", "=", "waiting"),
-                    ("dependency_job_ids", "!=", False),
-                ]
+            self.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET pending_dependency_count = pending_dependency_count - 1,
+                    state = CASE
+                        WHEN pending_dependency_count - 1 <= 0
+                            THEN 'pending'
+                        ELSE state
+                    END,
+                    write_date = NOW()
+                WHERE graph_uuid = %s
+                  AND state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                """,
+                (job.graph_uuid, json.dumps([job.id])),
             )
-            for dep in waiting_deps:
-                if job.id in (dep.dependency_job_ids or []):
-                    dep.pending_dependency_count -= 1
-                    if dep.pending_dependency_count <= 0:
-                        dep.state = "pending"
+        self.env.invalidate_all()
 
     def _fail_dependents(self):
         """Cascade failure to multi-parent dependents."""
+        self.env.flush_all()
         for job in self:
             if not job.graph_uuid:
                 continue
-            waiting_deps = self.search(
-                [
-                    ("graph_uuid", "=", job.graph_uuid),
-                    ("state", "=", "waiting"),
-                    ("dependency_job_ids", "!=", False),
-                ]
+            self.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET state = 'failed',
+                    exc_info = %s,
+                    write_date = NOW()
+                WHERE graph_uuid = %s
+                  AND state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                """,
+                (f"Parent job {job.id} failed", job.graph_uuid, json.dumps([job.id])),
             )
-            for dep in waiting_deps:
-                if job.id in (dep.dependency_job_ids or []):
-                    dep.state = "failed"
-                    dep.exc_info = f"Parent job {job.id} failed"
+        self.env.invalidate_all()
 
     def button_requeue(self):
         for job in self:
@@ -748,6 +771,14 @@ class QueueJob(models.Model):
         """Public API to enqueue a job with queue_job-compatible options."""
         from .job_serialization import JobEncoder
 
+        if not model_name or model_name not in self.env:
+            raise ValueError(f"Model {model_name!r} does not exist in the registry")
+        if method_name and method_name.startswith("__") and method_name.endswith("__"):
+            raise ValueError(
+                f"Dunder method {method_name!r} is not allowed in job queue"
+            )
+        identity_key = identity_key or None
+
         if eta is None and scheduled_at is not None:
             eta = scheduled_at
         if (
@@ -847,10 +878,10 @@ class QueueJob(models.Model):
                     "|",
                     "&",
                     ("state", "in", ["done", "failed"]),
-                    ("completed_at", "<", cutoff),
+                    ("completed_at", "<=", cutoff),
                     "&",
                     ("state", "=", "cancelled"),
-                    ("cancelled_at", "<", cutoff),
+                    ("cancelled_at", "<=", cutoff),
                 ],
                 limit=chunk_size,
             )

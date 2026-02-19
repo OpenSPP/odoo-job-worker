@@ -531,6 +531,26 @@ class TestGarbageCollectionEdgeCases(TransactionCase):
         self.Job._gc_old_jobs()
         self.assertFalse(self.Job.browse(job.id).exists())
 
+    def test_gc_zero_retention_deletes_cancelled_jobs_at_boundary(self):
+        """GC with 0 retention days should delete cancelled jobs whose
+        cancelled_at equals the cutoff exactly (the <= boundary)."""
+        fixed = datetime(2026, 6, 15, 12, 0, 0)
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "zero retention cancelled"}],
+            kwargs={},
+            channel="gc_zero_cancelled",
+        )
+        job.write({"state": "cancelled", "cancelled_at": fixed})
+        self.env["ir.config_parameter"].sudo().set_param(
+            "job_worker.done_job_retention_days", "0"
+        )
+        with patch("odoo.fields.Datetime.now", return_value=fixed):
+            self.Job._gc_old_jobs()
+        self.assertFalse(self.Job.browse(job.id).exists())
+
     def test_gc_done_job_without_completed_at_survives(self):
         """A done job with NULL completed_at should not be deleted
         by GC since the SQL comparison with NULL is always false."""

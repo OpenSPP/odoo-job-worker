@@ -67,7 +67,7 @@ class QueueJobMetric(models.Model):
                     0
                 ) AS p95_duration
             FROM queue_job
-            WHERE completed_at >= %s AND completed_at < %s
+            WHERE completed_at >= %s AND completed_at <= %s
             GROUP BY channel
             """,
             (window_start, now),

@@ -843,6 +843,59 @@ class TestMethodNameValidation(TransactionCase):
         self.assertTrue(job)
         self.assertEqual(job.state, "pending")
 
+    def test_dunder_str_blocked(self):
+        """__str__ should be blocked from job queue execution."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__str__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="dunder",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_dunder_call_blocked(self):
+        """__call__ should be blocked from job queue execution."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__call__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="dunder",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_double_underscore_only_blocked(self):
+        """A bare '__' matches the dunder pattern (starts and ends with __)
+        and should be blocked."""
+        with self.assertRaises(ValueError) as ctx:
+            self.Job.enqueue(
+                model_name="res.partner",
+                method_name="__",
+                record_ids=[],
+                args=[],
+                kwargs={},
+                channel="bare_double_underscore",
+            )
+        self.assertIn("Dunder method", str(ctx.exception))
+
+    def test_leading_double_underscore_without_trailing_allowed(self):
+        """A method like '__something' (no trailing __) is not a dunder
+        and should be allowed through."""
+        job = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="__something",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="leading_dunder",
+        )
+        self.assertTrue(job)
+
     def test_regular_method_allowed(self):
         """Regular public methods should be allowed."""
         job = self.Job.enqueue(

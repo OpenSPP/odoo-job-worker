@@ -59,6 +59,40 @@ class TestQueueJobMetric(TransactionCase):
         self.assertTrue(metrics)
         self.assertGreaterEqual(metrics[0].queue_depth, 3)
 
+    def test_collect_5min_snapshot_no_jobs_produces_no_metrics(self):
+        """When no jobs exist for a channel, no metric record should
+        be created for that channel."""
+        # Use a unique channel name with no jobs
+        channel = "metric_empty_channel_test"
+        self.Metric._collect_5min_snapshot()
+        metrics = self.Metric.search([("channel", "=", channel)])
+        self.assertFalse(metrics)
+
+    def test_collect_5min_snapshot_boundary_completed_at_equals_now(self):
+        """A job whose completed_at equals the snapshot's 'now' should
+        be included (the <= boundary)."""
+        from datetime import datetime
+        from unittest.mock import patch
+
+        fixed = datetime(2026, 6, 15, 12, 0, 0)
+        channel = "metric_boundary_test"
+        job = self.Job.enqueue(
+            model_name="res.users",
+            method_name="search",
+            record_ids=[],
+            args=[[("id", "=", self.env.user.id)]],
+            kwargs={},
+            channel=channel,
+        )
+        job.write({"state": "done", "completed_at": fixed, "duration": 2.0})
+
+        with patch("odoo.fields.Datetime.now", return_value=fixed):
+            self.Metric._collect_5min_snapshot()
+
+        metrics = self.Metric.search([("channel", "=", channel)])
+        self.assertTrue(metrics, "Metric should be created for boundary timestamp")
+        self.assertEqual(metrics[0].jobs_completed, 1)
+
     def test_rollup_hourly_aggregates_5min_rows(self):
         """_rollup_hourly aggregates 5-min rows into hourly."""
         now = fields.Datetime.now()
