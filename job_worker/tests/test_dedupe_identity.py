@@ -82,6 +82,31 @@ class TestIdentityKeyEdgeCases(TransactionCase):
         self.assertFalse(job1.identity_key)
         self.assertFalse(job2.identity_key)
 
+    def test_identity_key_none_treated_as_no_key(self):
+        """Explicit None identity_key should allow multiple independent
+        jobs without deduplication."""
+        job1 = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "none key 1"}],
+            kwargs={},
+            identity_key=None,
+            channel="none_key",
+        )
+        job2 = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "none key 2"}],
+            kwargs={},
+            identity_key=None,
+            channel="none_key",
+        )
+        self.assertNotEqual(job1.id, job2.id)
+        self.assertFalse(job1.identity_key)
+        self.assertFalse(job2.identity_key)
+
     def test_identity_key_very_long_string(self):
         """An extremely long identity key should be accepted."""
         long_key = "x" * 10000

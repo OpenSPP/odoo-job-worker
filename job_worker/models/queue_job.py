@@ -295,7 +295,10 @@ class QueueJob(models.Model):
         for record in self:
             payload = record.payload
             if isinstance(payload, str):
-                payload = json.loads(payload)
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
             if isinstance(payload, dict):
                 model = payload.get("model", "?")
                 method = payload.get("method", "?")
@@ -312,7 +315,10 @@ class QueueJob(models.Model):
             if record.result:
                 result = record.result
                 if isinstance(result, str):
-                    result = json.loads(result)
+                    try:
+                        result = json.loads(result)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 record.result_display = json.dumps(result, indent=2)
             else:
                 record.result_display = ""
@@ -344,7 +350,10 @@ class QueueJob(models.Model):
             if record.payload:
                 payload = record.payload
                 if isinstance(payload, str):
-                    payload = json.loads(payload)
+                    try:
+                        payload = json.loads(payload)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
                 record.payload_display = json.dumps(payload, indent=2)
             else:
                 record.payload_display = ""
@@ -354,7 +363,10 @@ class QueueJob(models.Model):
         for record in self:
             payload = record.payload
             if isinstance(payload, str):
-                payload = json.loads(payload)
+                try:
+                    payload = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    payload = None
             if isinstance(payload, dict):
                 model = payload.get("model", "")
                 method = payload.get("method", "")
@@ -748,6 +760,14 @@ class QueueJob(models.Model):
         """Public API to enqueue a job with queue_job-compatible options."""
         from .job_serialization import JobEncoder
 
+        if not model_name or model_name not in self.env:
+            raise ValueError(f"Model {model_name!r} does not exist in the registry")
+        if method_name and method_name.startswith("__") and method_name.endswith("__"):
+            raise ValueError(
+                f"Dunder method {method_name!r} is not allowed in job queue"
+            )
+        identity_key = identity_key or None
+
         if eta is None and scheduled_at is not None:
             eta = scheduled_at
         if (
@@ -847,10 +867,10 @@ class QueueJob(models.Model):
                     "|",
                     "&",
                     ("state", "in", ["done", "failed"]),
-                    ("completed_at", "<", cutoff),
+                    ("completed_at", "<=", cutoff),
                     "&",
                     ("state", "=", "cancelled"),
-                    ("cancelled_at", "<", cutoff),
+                    ("cancelled_at", "<=", cutoff),
                 ],
                 limit=chunk_size,
             )
