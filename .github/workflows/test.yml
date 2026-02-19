@@ -75,12 +75,17 @@ jobs:
       - name: Check test results
         if: always()
         run: |
-          if grep -q "failed, [1-9].*error(s)" test-output.log 2>/dev/null; then
+          # Match Odoo's test summary: "N failed, M error(s) of X tests"
+          if grep -qP "[1-9]\d* failed, \d+ error\(s\) of \d+ tests" test-output.log 2>/dev/null; then
+            echo "::error::Tests had failures"
+            exit 1
+          fi
+          if grep -qP "0 failed, [1-9]\d* error\(s\) of \d+ tests" test-output.log 2>/dev/null; then
             echo "::error::Tests had errors"
             exit 1
           fi
-          if grep -q "[1-9][0-9]* failed" test-output.log 2>/dev/null; then
-            echo "::error::Tests had failures"
+          if ! grep -qP "\d+ failed, \d+ error\(s\) of \d+ tests" test-output.log 2>/dev/null; then
+            echo "::error::No test summary found — tests may not have run"
             exit 1
           fi
           echo "All tests passed"
