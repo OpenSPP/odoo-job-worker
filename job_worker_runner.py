@@ -10,11 +10,17 @@ addons path) before importing the runner, avoiding the
 ModuleNotFoundError that occurs with ``python -m odoo.addons.job_worker.cli``.
 """
 
-from odoo.tools import config
 
-config.parse_config()
+def main():
+    from odoo.tools import config
 
-from odoo.addons.job_worker.cli.runner import QueueJobRunner  # noqa: E402
+    config.parse_config()
 
-runner = QueueJobRunner.from_environ_or_config()
-runner.run()
+    from odoo.addons.job_worker.cli.runner import QueueJobRunner
+
+    runner = QueueJobRunner.from_environ_or_config()
+    runner.run()
+
+
+if __name__ == "__main__":
+    main()
