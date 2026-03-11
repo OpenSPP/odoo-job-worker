@@ -5,6 +5,7 @@
     "category": "Generic Modules",
     "website": "https://github.com/OpenSPP",
     "author": "OpenSPP",
+    "development_status": "Beta",
     "license": "LGPL-3",
     "depends": ["base", "web"],
     "data": [
