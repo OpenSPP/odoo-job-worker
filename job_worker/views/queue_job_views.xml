@@ -288,16 +288,16 @@
                         <page string="Payload">
                             <field
                 name="payload_display"
-                widget="ace"
-                options="{'mode': 'json'}"
+                widget="code"
+                options="{'language': 'json'}"
                 readonly="1"
               />
                         </page>
                         <page string="Result" invisible="not result">
                             <field
                 name="result_display"
-                widget="ace"
-                options="{'mode': 'json'}"
+                widget="code"
+                options="{'language': 'json'}"
                 readonly="1"
               />
                         </page>
