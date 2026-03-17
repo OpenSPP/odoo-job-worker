@@ -158,7 +158,7 @@ class QueueWorker:
             registry = Registry(self.db_name)
             registry.check_signaling()
         except Exception:
-            _logger.debug("Registry check failed for %s", self.db_name, exc_info=True)
+            _logger.warning("Registry check failed for %s", self.db_name, exc_info=True)
 
     def run(self):
         """
