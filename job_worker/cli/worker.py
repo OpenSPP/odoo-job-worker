@@ -137,7 +137,7 @@ class QueueWorker:
             max_workers=self.concurrency,
             thread_name_prefix=f"job-exec-{self.db_name}",
         )
-        self._last_registry_check = 0.0
+        self._last_registry_check = time.monotonic()
 
     def _check_registry(self):
         """Check if the Odoo registry has changed and reload if needed.
