@@ -140,7 +140,7 @@ class QueueJobRunner:
     def __init__(
         self,
         database_names=None,
-        discovery_interval_seconds=300,
+        discovery_interval_seconds=60,
         use_advisory_lock=True,
         maximum_consecutive_failures=5,
         failure_window_seconds=300,

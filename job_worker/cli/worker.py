@@ -119,6 +119,7 @@ class QueueWorker:
         heartbeat_interval_seconds=15,
         max_backoff_seconds=3600,
         concurrency=2,
+        registry_check_interval=30,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -130,11 +131,36 @@ class QueueWorker:
         self.heartbeat_interval_seconds = max(1, int(heartbeat_interval_seconds))
         self.max_backoff_seconds = max(10, int(max_backoff_seconds))
         self.concurrency = max(1, int(concurrency))
+        self.registry_check_interval = max(5, int(registry_check_interval))
         self.db = odoo.sql_db.db_connect(self.db_name)
         self._pool = ThreadPoolExecutor(
             max_workers=self.concurrency,
             thread_name_prefix=f"job-exec-{self.db_name}",
         )
+        self._last_registry_check = 0.0
+
+    def _check_registry(self):
+        """Check if the Odoo registry has changed and reload if needed.
+
+        Odoo increments a database sequence when modules are installed,
+        updated, or uninstalled.  ``registry.check_signaling()`` detects
+        this and transparently rebuilds the registry so that newly added
+        model methods (e.g. from a freshly installed module) become
+        available to the worker without a manual restart.
+        """
+        now = time.monotonic()
+        if now - self._last_registry_check < self.registry_check_interval:
+            return
+        self._last_registry_check = now
+        try:
+            from odoo.orm.registry import Registry
+
+            registry = Registry(self.db_name)
+            registry.check_signaling()
+        except Exception:
+            _logger.debug(
+                "Registry check failed for %s", self.db_name, exc_info=True
+            )
 
     def run(self):
         """
@@ -149,6 +175,9 @@ class QueueWorker:
                 _logger.info("Listening for jobs (concurrency=%d)...", self.concurrency)
 
                 while not self.stop_event.is_set():
+                    # 0. Check for registry changes (module install/update)
+                    self._check_registry()
+
                     # 1. Process jobs until queue is empty or limit reached
                     self.process_jobs()
 
