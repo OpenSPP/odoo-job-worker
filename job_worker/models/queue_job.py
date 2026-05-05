@@ -673,32 +673,66 @@ class QueueJob(models.Model):
         self._fail_dependents()
 
     def _cascade_children_on_parent_success(self):
-        """Release waiting parent_id children when this parent completes.
+        """Release waiting parent_id descendants when this parent completes.
 
-        on_done children (run_on_failure=False) move waiting → pending.
-        on_error children (run_on_failure=True) are cancelled.
+        on_done descendants (run_on_failure=False) move waiting → pending and
+        will cascade themselves when they later run.
+        on_error descendants (run_on_failure=True) are cancelled (no failure
+        occurred). Cancelled jobs never run, so we walk the chain and
+        propagate cancellation to grandchildren — otherwise they would stay
+        stuck in 'waiting' forever.
         """
         self.ensure_one()
         now = fields.Datetime.now()
+        # BFS over jobs that transition to a *terminal* state without running.
+        # Jobs we transition to 'pending' are not enqueued for further walks
+        # because they will run normally and cascade themselves.
+        cancelled_queue = []
         for child in self.child_ids.filtered(lambda c: c.state == "waiting"):
             if child.run_on_failure:
                 child.write({"state": "cancelled", "cancelled_at": now})
+                cancelled_queue.append(child)
             else:
                 child.state = "pending"
+        while cancelled_queue:
+            job = cancelled_queue.pop(0)
+            for grandchild in job.child_ids.filtered(lambda c: c.state == "waiting"):
+                # Parent (the cancelled job) never produced success or failure,
+                # so neither on_done nor on_error firing is appropriate. Cancel
+                # downward.
+                grandchild.write({"state": "cancelled", "cancelled_at": now})
+                cancelled_queue.append(grandchild)
 
     def _cascade_children_on_parent_failure(self):
-        """Cascade waiting parent_id children when this parent fails.
+        """Cascade waiting parent_id descendants when this parent fails.
 
-        on_done children (run_on_failure=False) cascade to failed.
-        on_error children (run_on_failure=True) are promoted to pending.
+        on_done descendants (run_on_failure=False) cascade to failed and the
+        chain is walked so grandchildren also fail (the cascade-failed job
+        never runs to trigger its own descendants).
+        on_error descendants (run_on_failure=True) are promoted to pending —
+        they will run normally and cascade themselves when they finish.
         """
         self.ensure_one()
+        # BFS over jobs that transition to 'failed' without running. Jobs we
+        # transition to 'pending' (on_error) will run normally and cascade
+        # themselves, so we don't enqueue them.
+        failed_queue = []
         for child in self.child_ids.filtered(lambda c: c.state == "waiting"):
             if child.run_on_failure:
                 child.state = "pending"
             else:
                 child.state = "failed"
                 child.exc_info = f"Parent job {self.id} failed"
+                failed_queue.append(child)
+        while failed_queue:
+            job = failed_queue.pop(0)
+            for grandchild in job.child_ids.filtered(lambda c: c.state == "waiting"):
+                if grandchild.run_on_failure:
+                    grandchild.state = "pending"
+                else:
+                    grandchild.state = "failed"
+                    grandchild.exc_info = f"Parent job {job.id} failed"
+                    failed_queue.append(grandchild)
 
     def button_cancelled(self):
         now = fields.Datetime.now()

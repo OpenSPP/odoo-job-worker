@@ -221,6 +221,13 @@ class DelayableGroup:
         self._delayables = list(delayables)
         self._next_delayables = []
         self._on_error_delayables = []
+        # Mirror Delayable's wiring attrs so a group can itself be passed as
+        # an on_done/on_error target of an outer scheduler. The outer .delay()
+        # writes these on us before calling our .delay(); we must honor them.
+        self._graph_uuid = None
+        self._parent_job_id = None
+        self._dependency_job_ids = None
+        self._run_on_failure = False
 
     def on_done(self, *delayables):
         self._next_delayables.extend(delayables)
@@ -231,10 +238,24 @@ class DelayableGroup:
         return self
 
     def delay(self):
-        graph_uuid = str(_uuid.uuid4())
+        # Honor inherited graph context so nested groups stay in the same
+        # graph as their outer scheduler — otherwise group barriers break.
+        graph_uuid = self._graph_uuid or str(_uuid.uuid4())
         member_jobs = []
         for delayable in self._delayables:
             delayable._graph_uuid = graph_uuid
+            # Members of a nested group inherit the outer wiring so they
+            # wait on the same parent / dependencies and carry the same
+            # failure-vs-success disposition.
+            if self._parent_job_id is not None and delayable._parent_job_id is None:
+                delayable._parent_job_id = self._parent_job_id
+            if (
+                self._dependency_job_ids is not None
+                and delayable._dependency_job_ids is None
+            ):
+                delayable._dependency_job_ids = list(self._dependency_job_ids)
+            if self._run_on_failure:
+                delayable._run_on_failure = True
             job = delayable.delay()
             member_jobs.append(job.id)
         for next_delayable in self._next_delayables:
@@ -259,6 +280,10 @@ class DelayableChain:
         self._delayables = list(delayables)
         self._next_delayables = []
         self._on_error_delayables = []
+        self._graph_uuid = None
+        self._parent_job_id = None
+        self._dependency_job_ids = None
+        self._run_on_failure = False
 
     def on_done(self, *delayables):
         self._next_delayables.extend(delayables)
@@ -269,13 +294,30 @@ class DelayableChain:
         return self
 
     def delay(self):
-        graph_uuid = str(_uuid.uuid4())
+        graph_uuid = self._graph_uuid or str(_uuid.uuid4())
         previous_job = None
+        first = True
         for delayable in self._delayables:
             delayable._graph_uuid = graph_uuid
             if previous_job:
                 delayable._parent_job_id = previous_job.id
+            elif (
+                first
+                and self._parent_job_id is not None
+                and delayable._parent_job_id is None
+            ):
+                # The chain's head waits on the outer parent.
+                delayable._parent_job_id = self._parent_job_id
+            if (
+                first
+                and self._dependency_job_ids is not None
+                and delayable._dependency_job_ids is None
+            ):
+                delayable._dependency_job_ids = list(self._dependency_job_ids)
+            if self._run_on_failure:
+                delayable._run_on_failure = True
             previous_job = delayable.delay()
+            first = False
         for next_delayable in self._next_delayables:
             next_delayable._graph_uuid = graph_uuid
             if previous_job:

@@ -516,6 +516,218 @@ class TestOnErrorSemantics(TransactionCase):
 
 
 @tagged("post_install", "-at_install")
+class TestDeepCascadeSemantics(TransactionCase):
+    """Cascades walk the full dependency chain — grandchildren must not
+    stay stuck in 'waiting' when an ancestor terminates without running."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_failure_cascade_recurses_into_grandchildren(self):
+        """A → B → C: when A fails, both B and C transition to failed."""
+        partner = self.env["res.partner"].create({"name": "DeepFail"})
+        a = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="method_does_not_exist",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="deep_cascade",
+        )
+        b = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "B"}],
+            kwargs={},
+            parent_id=a.id,
+            channel="deep_cascade",
+        )
+        c = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "C"}],
+            kwargs={},
+            parent_id=b.id,
+            channel="deep_cascade",
+        )
+        self.assertEqual(b.state, "waiting")
+        self.assertEqual(c.state, "waiting")
+
+        try:
+            a.run_now()
+        except AttributeError:
+            pass
+        a.invalidate_recordset()
+        b.invalidate_recordset()
+        c.invalidate_recordset()
+        self.assertEqual(a.state, "failed")
+        self.assertEqual(b.state, "failed")
+        self.assertEqual(c.state, "failed", "Grandchild must not stay in waiting")
+
+    def test_failure_cascade_promotes_on_error_grandchild(self):
+        """A → B → (C is on_error): A fails → B fails → C runs (run_on_failure)."""
+        partner = self.env["res.partner"].create({"name": "DeepFailErr"})
+        a = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="method_does_not_exist",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="deep_cascade",
+        )
+        b = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "B"}],
+            kwargs={},
+            parent_id=a.id,
+            channel="deep_cascade",
+        )
+        c = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "C ran"}],
+            kwargs={},
+            parent_id=b.id,
+            run_on_failure=True,
+            channel="deep_cascade",
+        )
+
+        try:
+            a.run_now()
+        except AttributeError:
+            pass
+        b.invalidate_recordset()
+        c.invalidate_recordset()
+        self.assertEqual(b.state, "failed")
+        self.assertEqual(c.state, "pending", "on_error grandchild must run")
+
+    def test_success_cascade_cancels_on_error_subtree(self):
+        """A → (B is on_error) → C: A succeeds → B cancelled → C also cancelled."""
+        a_partner = self.env["res.partner"].create({"name": "SuccA"})
+        b_partner = self.env["res.partner"].create({"name": "SuccB"})
+        c_partner = self.env["res.partner"].create({"name": "SuccC"})
+
+        a = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=a_partner.ids,
+            args=[{"name": "A done"}],
+            kwargs={},
+            channel="deep_cascade",
+        )
+        b = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=b_partner.ids,
+            args=[{"name": "B"}],
+            kwargs={},
+            parent_id=a.id,
+            run_on_failure=True,
+            channel="deep_cascade",
+        )
+        c = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=c_partner.ids,
+            args=[{"name": "C"}],
+            kwargs={},
+            parent_id=b.id,
+            channel="deep_cascade",
+        )
+
+        a.run_now()
+        b.invalidate_recordset()
+        c.invalidate_recordset()
+        self.assertEqual(b.state, "cancelled")
+        self.assertEqual(
+            c.state,
+            "cancelled",
+            "Grandchild of cancelled parent must not stay in waiting",
+        )
+
+
+@tagged("post_install", "-at_install")
+class TestNestedDelayables(TransactionCase):
+    """Nested DelayableGroup / DelayableChain inherit graph context and
+    execution flags from their outer scheduler."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_nested_group_inherits_graph_uuid(self):
+        """A group passed as on_done(...) shares its outer graph_uuid."""
+        outer_a = self.env["res.partner"].create({"name": "OutA"})
+        outer_b = self.env["res.partner"].create({"name": "OutB"})
+        inner_a = self.env["res.partner"].create({"name": "InA"})
+        inner_b = self.env["res.partner"].create({"name": "InB"})
+
+        group(
+            outer_a.delayable().write({"name": "OutA done"}),
+            outer_b.delayable().write({"name": "OutB done"}),
+        ).on_done(
+            group(
+                inner_a.delayable().write({"name": "InA done"}),
+                inner_b.delayable().write({"name": "InB done"}),
+            )
+        ).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=4)
+        graph_uuids = {j.graph_uuid for j in jobs}
+        self.assertEqual(
+            len(graph_uuids),
+            1,
+            f"All nested jobs must share one graph_uuid, got {graph_uuids}",
+        )
+        self.assertTrue(next(iter(graph_uuids)))
+
+    def test_nested_group_in_on_error_propagates_run_on_failure(self):
+        """A group passed as on_error(...) marks every member as run_on_failure."""
+        outer = self.env["res.partner"].create({"name": "OuterFailing"})
+        inner_a = self.env["res.partner"].create({"name": "InnerA"})
+        inner_b = self.env["res.partner"].create({"name": "InnerB"})
+
+        outer.delayable().method_does_not_exist().on_error(
+            group(
+                inner_a.delayable().write({"name": "InnerA cleanup"}),
+                inner_b.delayable().write({"name": "InnerB cleanup"}),
+            )
+        ).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3)
+        # Outer is the parent; the two inner members are dependents
+        inner_jobs = jobs.filtered(lambda j: j.run_on_failure)
+        self.assertEqual(
+            len(inner_jobs), 2, "Both nested members must inherit run_on_failure=True"
+        )
+
+    def test_nested_chain_inherits_graph_uuid(self):
+        """A chain passed as on_done(...) shares its outer graph_uuid."""
+        outer = self.env["res.partner"].create({"name": "ChainOut"})
+        a = self.env["res.partner"].create({"name": "ChainA"})
+        b = self.env["res.partner"].create({"name": "ChainB"})
+
+        outer.delayable().write({"name": "ChainOut done"}).on_done(
+            chain(
+                a.delayable().write({"name": "ChainA done"}),
+                b.delayable().write({"name": "ChainB done"}),
+            )
+        ).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3)
+        graph_uuids = {j.graph_uuid for j in jobs}
+        self.assertEqual(
+            len(graph_uuids), 1, "Chain members must share outer graph_uuid"
+        )
+
+
+@tagged("post_install", "-at_install")
 class TestChainGraphEdgeCases(TransactionCase):
     """Probe job chain/graph edge cases."""
 
