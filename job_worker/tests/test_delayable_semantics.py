@@ -299,6 +299,223 @@ class TestDelayableSemantics(TransactionCase):
 
 
 @tagged("post_install", "-at_install")
+class TestOnErrorSemantics(TransactionCase):
+    """on_error() callback runs when dependencies fail and is cancelled
+    when they succeed.
+
+    The mechanism backs cleanup callbacks that must clear locks or post
+    failure chatter even when an async pipeline fails."""
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def test_on_error_flag_persists_through_enqueue(self):
+        a = self.env["res.partner"].create({"name": "ErrFlagA"})
+        b = self.env["res.partner"].create({"name": "ErrFlagB"})
+
+        d_a = a.delayable().write({"name": "ErrFlagA done"})
+        d_b = b.delayable().write({"name": "ErrFlagB cleanup"})
+        d_a.on_error(d_b)
+        parent_job = d_a.delay()
+
+        callback = self.Job.search(
+            [("id", "!=", parent_job.id)], order="id desc", limit=1
+        )
+        self.assertTrue(callback.run_on_failure)
+        self.assertEqual(callback.state, "waiting")
+
+    def test_on_error_runs_when_parent_fails_via_run_now(self):
+        """Single-parent on_error: child promotes to pending on parent failure."""
+        b = self.env["res.partner"].create({"name": "ErrCleanup"})
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="method_does_not_exist",
+            record_ids=[],
+            args=[],
+            kwargs={},
+            channel="on_error_test",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=b.ids,
+            args=[{"name": "ErrCleanup ran"}],
+            kwargs={},
+            parent_id=parent.id,
+            run_on_failure=True,
+            channel="on_error_test",
+        )
+        self.assertEqual(child.state, "waiting")
+
+        try:
+            parent.run_now()
+        except AttributeError:
+            pass
+        parent.invalidate_recordset()
+        child.invalidate_recordset()
+        self.assertEqual(parent.state, "failed")
+        self.assertEqual(child.state, "pending")
+
+    def test_on_error_cancelled_when_parent_succeeds_via_run_now(self):
+        """Single-parent on_error: child is cancelled (not run) on parent success."""
+        partner = self.env["res.partner"].create({"name": "OkParent"})
+        cleanup = self.env["res.partner"].create({"name": "Cleanup"})
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=partner.ids,
+            args=[{"name": "OkParent done"}],
+            kwargs={},
+            channel="on_error_test",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=cleanup.ids,
+            args=[{"name": "Cleanup ran"}],
+            kwargs={},
+            parent_id=parent.id,
+            run_on_failure=True,
+            channel="on_error_test",
+        )
+        self.assertEqual(child.state, "waiting")
+
+        parent.run_now()
+        parent.invalidate_recordset()
+        child.invalidate_recordset()
+        self.assertEqual(parent.state, "done")
+        self.assertEqual(child.state, "cancelled")
+        self.assertTrue(child.cancelled_at)
+
+    def test_on_error_runs_when_button_set_to_failed(self):
+        """Manual fail-out: on_error child promotes to pending."""
+        cleanup = self.env["res.partner"].create({"name": "Cleanup btn"})
+        parent = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="create",
+            record_ids=[],
+            args=[{"name": "btn parent"}],
+            kwargs={},
+            channel="on_error_test",
+        )
+        child = self.Job.enqueue(
+            model_name="res.partner",
+            method_name="write",
+            record_ids=cleanup.ids,
+            args=[{"name": "Cleanup ran btn"}],
+            kwargs={},
+            parent_id=parent.id,
+            run_on_failure=True,
+            channel="on_error_test",
+        )
+
+        parent.button_set_to_failed()
+        child.invalidate_recordset()
+        self.assertEqual(child.state, "pending")
+
+    def test_group_on_error_runs_when_one_member_fails(self):
+        """Group on_error: failure handler fires on first member failure."""
+        a = self.env["res.partner"].create({"name": "GErrA"})
+        b = self.env["res.partner"].create({"name": "GErrB"})
+        c = self.env["res.partner"].create({"name": "GErrCleanup"})
+
+        group(
+            a.delayable().method_does_not_exist(),
+            b.delayable().write({"name": "GErrB done"}),
+        ).on_error(c.delayable().write({"name": "GErrCleanup ran"})).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
+        member_a, _member_b, callback = jobs[0], jobs[1], jobs[2]
+        self.assertTrue(callback.run_on_failure)
+        self.assertEqual(callback.state, "waiting")
+
+        try:
+            member_a.run_now()
+        except AttributeError:
+            pass
+
+        member_a.invalidate_recordset()
+        callback.invalidate_recordset()
+        self.assertEqual(member_a.state, "failed")
+        self.assertEqual(callback.state, "pending")
+
+    def test_group_on_error_cancelled_when_all_members_succeed(self):
+        """Group on_error: failure handler is cancelled when all deps succeed."""
+        a = self.env["res.partner"].create({"name": "GOkA"})
+        b = self.env["res.partner"].create({"name": "GOkB"})
+        c = self.env["res.partner"].create({"name": "GOkCleanup"})
+
+        group(
+            a.delayable().write({"name": "GOkA done"}),
+            b.delayable().write({"name": "GOkB done"}),
+        ).on_error(c.delayable().write({"name": "GOkCleanup ran"})).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=3).sorted("id")
+        member_a, member_b, callback = jobs[0], jobs[1], jobs[2]
+        self.assertTrue(callback.run_on_failure)
+
+        member_a.run_now()
+        member_b.run_now()
+        callback.invalidate_recordset()
+        self.assertEqual(callback.state, "cancelled")
+        self.assertTrue(callback.cancelled_at)
+
+    def test_group_on_done_and_on_error_paired_success(self):
+        """When both on_done and on_error are wired, success runs on_done
+        and cancels on_error."""
+        a = self.env["res.partner"].create({"name": "PairOkA"})
+        b = self.env["res.partner"].create({"name": "PairOkB"})
+        c = self.env["res.partner"].create({"name": "PairOkOk"})
+        d = self.env["res.partner"].create({"name": "PairOkErr"})
+
+        group(
+            a.delayable().write({"name": "PairOkA done"}),
+            b.delayable().write({"name": "PairOkB done"}),
+        ).on_done(c.delayable().write({"name": "PairOkOk ran"})).on_error(
+            d.delayable().write({"name": "PairOkErr ran"})
+        ).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=4).sorted("id")
+        member_a, member_b, ok_cb, err_cb = jobs[0], jobs[1], jobs[2], jobs[3]
+        self.assertFalse(ok_cb.run_on_failure)
+        self.assertTrue(err_cb.run_on_failure)
+
+        member_a.run_now()
+        member_b.run_now()
+        ok_cb.invalidate_recordset()
+        err_cb.invalidate_recordset()
+        self.assertEqual(ok_cb.state, "pending")
+        self.assertEqual(err_cb.state, "cancelled")
+
+    def test_group_on_done_and_on_error_paired_failure(self):
+        """When a member fails: on_done cascades to failed, on_error promotes."""
+        a = self.env["res.partner"].create({"name": "PairFailA"})
+        b = self.env["res.partner"].create({"name": "PairFailB"})
+        c = self.env["res.partner"].create({"name": "PairFailOk"})
+        d = self.env["res.partner"].create({"name": "PairFailErr"})
+
+        group(
+            a.delayable().method_does_not_exist(),
+            b.delayable().write({"name": "PairFailB done"}),
+        ).on_done(c.delayable().write({"name": "PairFailOk ran"})).on_error(
+            d.delayable().write({"name": "PairFailErr ran"})
+        ).delay()
+
+        jobs = self.Job.search([], order="id desc", limit=4).sorted("id")
+        member_a, _member_b, ok_cb, err_cb = jobs[0], jobs[1], jobs[2], jobs[3]
+
+        try:
+            member_a.run_now()
+        except AttributeError:
+            pass
+        ok_cb.invalidate_recordset()
+        err_cb.invalidate_recordset()
+        self.assertEqual(ok_cb.state, "failed")
+        self.assertEqual(err_cb.state, "pending")
+
+
+@tagged("post_install", "-at_install")
 class TestChainGraphEdgeCases(TransactionCase):
     """Probe job chain/graph edge cases."""
 

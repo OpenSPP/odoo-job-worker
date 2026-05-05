@@ -45,9 +45,11 @@ class Delayable:
         self._job_kwargs = {}
         self._generated_job = None
         self._next_delayables = []
+        self._on_error_delayables = []
         self._graph_uuid = None
         self._parent_job_id = None
         self._dependency_job_ids = None
+        self._run_on_failure = False
 
     def __del__(self):
         try:
@@ -124,7 +126,7 @@ class Delayable:
 
         # Only generate graph_uuid for multi-job graphs
         graph_uuid = self._graph_uuid
-        if not graph_uuid and self._next_delayables:
+        if not graph_uuid and (self._next_delayables or self._on_error_delayables):
             graph_uuid = str(_uuid.uuid4())
 
         self._generated_job = self.recordset.env["queue.job"].enqueue(
@@ -147,11 +149,17 @@ class Delayable:
             graph_uuid=graph_uuid,
             timeout=self.timeout if self.timeout is not None else DEFAULT_TIMEOUT,
             dependency_job_ids=self._dependency_job_ids,
+            run_on_failure=self._run_on_failure,
         )
         for next_delayable in self._next_delayables:
             next_delayable._graph_uuid = graph_uuid
             next_delayable._parent_job_id = self._generated_job.id
             next_delayable.delay()
+        for error_delayable in self._on_error_delayables:
+            error_delayable._graph_uuid = graph_uuid
+            error_delayable._parent_job_id = self._generated_job.id
+            error_delayable._run_on_failure = True
+            error_delayable.delay()
         if must_run_without_delay(self.recordset.env):
             self._generated_job.run_now()
         return self._generated_job
@@ -192,6 +200,16 @@ class Delayable:
         self._next_delayables.extend(delayables)
         return self
 
+    def on_error(self, *delayables):
+        """Schedule callback(s) that run when this delayable resolves to failed.
+
+        Mirrors :meth:`on_done`, but the registered jobs run only on cascade
+        failure of their parent (or barrier dependency). On success, the
+        callback is auto-cancelled.
+        """
+        self._on_error_delayables.extend(delayables)
+        return self
+
 
 class DelayableGroup:
     """Upstream-compatible group wrapper.
@@ -202,9 +220,14 @@ class DelayableGroup:
     def __init__(self, *delayables):
         self._delayables = list(delayables)
         self._next_delayables = []
+        self._on_error_delayables = []
 
     def on_done(self, *delayables):
         self._next_delayables.extend(delayables)
+        return self
+
+    def on_error(self, *delayables):
+        self._on_error_delayables.extend(delayables)
         return self
 
     def delay(self):
@@ -218,6 +241,11 @@ class DelayableGroup:
             next_delayable._graph_uuid = graph_uuid
             next_delayable._dependency_job_ids = list(member_jobs)
             next_delayable.delay()
+        for error_delayable in self._on_error_delayables:
+            error_delayable._graph_uuid = graph_uuid
+            error_delayable._dependency_job_ids = list(member_jobs)
+            error_delayable._run_on_failure = True
+            error_delayable.delay()
 
 
 class DelayableChain:
@@ -230,9 +258,14 @@ class DelayableChain:
     def __init__(self, *delayables):
         self._delayables = list(delayables)
         self._next_delayables = []
+        self._on_error_delayables = []
 
     def on_done(self, *delayables):
         self._next_delayables.extend(delayables)
+        return self
+
+    def on_error(self, *delayables):
+        self._on_error_delayables.extend(delayables)
         return self
 
     def delay(self):
@@ -248,6 +281,12 @@ class DelayableChain:
             if previous_job:
                 next_delayable._parent_job_id = previous_job.id
             next_delayable.delay()
+        for error_delayable in self._on_error_delayables:
+            error_delayable._graph_uuid = graph_uuid
+            if previous_job:
+                error_delayable._parent_job_id = previous_job.id
+            error_delayable._run_on_failure = True
+            error_delayable.delay()
 
 
 class DelayableRecordset:
