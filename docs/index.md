@@ -2,12 +2,6 @@
 
 **High-performance, SQL-driven background job engine for Odoo.**
 
-!!! warning "Pre-Release Software"
-    This project is under active development and has not yet undergone the level of
-    testing and review required for production use. APIs, field names, and behaviors
-    may change without notice. Use in staging and development environments, and
-    expect breaking changes until a stable release is announced.
-
 Odoo Job Worker replaces traditional cron-based or memory-resident job queues with a
 PostgreSQL-native architecture built on `FOR UPDATE SKIP LOCKED` and `LISTEN/NOTIFY`.
 Jobs are durable rows in the database — no broker, no Redis, no external dependencies
