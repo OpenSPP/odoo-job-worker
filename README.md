@@ -2,8 +2,6 @@
 
 High-performance, SQL-driven background job engine for Odoo.
 
-> **Pre-Release Software** — This project is under active development and has not yet undergone the level of testing and review required for production use. APIs, field names, and behaviors may change without notice.
-
 **[Documentation](https://openspp.github.io/odoo-job-worker)** | **[Migration Guide](https://openspp.github.io/odoo-job-worker/migration/)**
 
 ## Description
