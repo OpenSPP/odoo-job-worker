@@ -252,14 +252,23 @@ class QueueWorker:
                 self.active_job_ids.add(job_id)
             self._pool.submit(self._execute_and_cleanup, job_id)
 
+    @retry_on_serialization_failure(max_retries=3, base_delay=0.05)
     def _acquire_job(self):
         """Acquire one job using SKIP LOCKED and commit the 'started' state.
 
         Returns the job ID or None if no job is available.
         Exceptions propagate up (appropriate for connection failures —
         runner will restart the worker).
+
+        Uses READ COMMITTED isolation and a serialization-failure retry
+        wrapper. The acquire query has a WITH clause whose aggregation
+        subqueries (fresh_running_counts, recent_starts_counts) read
+        many rows, and under REPEATABLE READ contention these snapshots
+        can race with concurrent commits and surface as
+        ``SerializationFailure`` — even though the FOR UPDATE SKIP LOCKED
+        clause itself is conflict-free.
         """
-        with self.db.cursor() as cr:
+        with read_committed_cursor(self.db) as cr:
             job_id = self.acquire_job_lock(cr)
             if not job_id:
                 return None

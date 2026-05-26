@@ -7,11 +7,16 @@ All imports from ``odoo.addons.job_worker`` are deferred until after
 Python resolves them.
 """
 
+import sys
+
 import odoo
 
 
 def main():
-    odoo.tools.config.parse_config()
+    # Pass sys.argv[1:] explicitly. Calling parse_config() with no
+    # args only reads odoo.conf and ignores CLI flags entirely; see
+    # the docstring of odoo.tools.config.parse_config.
+    odoo.tools.config.parse_config(sys.argv[1:])
     # Import after parse_config so the addons path is registered
     from .runner import QueueJobRunner
 
