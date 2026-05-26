@@ -33,3 +33,8 @@ from . import test_stress_s2_burst_under_depth
 from . import test_stress_s6_retry_storm
 from . import test_stress_s10_pg18_serialization
 from . import test_stress_s3_multi_worker
+from . import test_stress_s8_abort
+from . import test_stress_s4_channel_concurrency
+from . import test_stress_s5_rate_limit
+from . import test_stress_s7_timeout_under_load
+from . import test_stress_s9_notify_flood
