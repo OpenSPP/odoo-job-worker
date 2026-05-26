@@ -1,23 +1,33 @@
-"""Shared helpers for Tier 1 stress tests.
+"""Shared helpers for Tier 1 and Tier 2 stress tests.
 
-Kept deliberately small: invariants checker, percentile math, and a
-report writer that drops a JSON artifact under
-``<repo>/scripts/stress/_reports/<UTC-timestamp>/<scenario>.json`` so
-Tier 1 and Tier 2 share an output location.
+Kept deliberately small: invariants checker, percentile math, JSON
+report writer, and (for Tier 2) helpers to spawn the real
+``job_worker_runner.py`` as a subprocess.
 
 Scenarios opt into reporting; they are not required to. Reporting
 failures (e.g. read-only filesystem) downgrade to a log line so a
 broken artifact path never breaks a test.
 """
 
+import contextlib
 import json
 import logging
 import os
+import signal
+import subprocess
+import time
 from datetime import datetime, timezone
 
+import odoo
 from odoo import SUPERUSER_ID, api
 
 _logger = logging.getLogger(__name__)
+
+# Location of the standalone runner script inside the container. The
+# repo is bind-mounted into the test image at /mnt/extra-addons.
+RUNNER_SCRIPT_DEFAULT = (
+    "/mnt/extra-addons/odoo-job-worker/job_worker_runner.py"
+)
 
 
 def clear_queue(env):
@@ -173,3 +183,222 @@ def fresh_env(registry):
     """
     cr = registry.cursor()
     return cr, api.Environment(cr, SUPERUSER_ID, {})
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 helpers — spawn the real job_worker_runner.py as a subprocess.
+# ---------------------------------------------------------------------------
+
+
+def _runner_argv(db_name, runner_script=RUNNER_SCRIPT_DEFAULT):
+    """Build the argv for a runner subprocess against ``db_name``.
+
+    Copies addons-path and DB connection params from the currently
+    running Odoo's config so the child process can reach the same
+    database (typically the test DB) with the same modules visible.
+    """
+    cfg = odoo.tools.config
+    addons_path = cfg["addons_path"]
+    if isinstance(addons_path, list):
+        addons_path = ",".join(addons_path)
+    argv = [
+        "python3",
+        runner_script,
+        "-d",
+        db_name,
+        "--addons-path=" + addons_path,
+    ]
+    for key in ("db_host", "db_port", "db_user", "db_password"):
+        value = cfg.get(key)
+        if value:
+            argv.append(f"--{key}={value}")
+    # Info-level so the test can see "Worker starting", discovery
+    # decisions, and per-DB log messages on shutdown.
+    argv.append("--log-level=info")
+    return argv
+
+
+def spawn_runner(db_name, *, concurrency=2, env_overrides=None,
+                 runner_script=RUNNER_SCRIPT_DEFAULT):
+    """Spawn the real ``job_worker_runner.py`` as a subprocess.
+
+    Returns a ``subprocess.Popen``. Caller is responsible for terminating
+    via :func:`terminate_runner` (or use :func:`runner_subprocess` as a
+    context manager).
+
+    Concurrency is set via ``QUEUE_JOB_CONCURRENCY`` env var, which
+    ``QueueJobRunner.from_environ_or_config`` already reads.
+    """
+    env = dict(os.environ)
+    env["QUEUE_JOB_CONCURRENCY"] = str(int(concurrency))
+    # Force a stable discovery interval (default 60s) so newly-installed
+    # modules are picked up by the supervisor without long waits.
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    if env_overrides:
+        env.update({k: str(v) for k, v in env_overrides.items()})
+    argv = _runner_argv(db_name, runner_script=runner_script)
+    _logger.info("Spawning runner: %s (concurrency=%d)", " ".join(argv), concurrency)
+    return subprocess.Popen(
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15,
+                     kill_timeout=5):
+    """Send ``sig`` to a runner subprocess and wait for exit.
+
+    Falls back to SIGKILL after ``graceful_timeout`` seconds. Drains
+    stdout/stderr to avoid orphaned pipes. Returns the captured (stdout,
+    stderr) bytes for diagnostics.
+
+    Idempotent: safe to call on an already-exited process.
+    """
+    if proc.poll() is None:
+        try:
+            proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
+    try:
+        stdout, stderr = proc.communicate(timeout=graceful_timeout)
+    except subprocess.TimeoutExpired:
+        _logger.warning(
+            "Runner pid=%s did not exit on %s within %ds; sending SIGKILL",
+            proc.pid,
+            sig,
+            graceful_timeout,
+        )
+        proc.kill()
+        try:
+            stdout, stderr = proc.communicate(timeout=kill_timeout)
+        except subprocess.TimeoutExpired:
+            _logger.error("Runner pid=%s did not exit even on SIGKILL", proc.pid)
+            stdout, stderr = b"", b""
+    return stdout, stderr
+
+
+@contextlib.contextmanager
+def runner_subprocess(db_name, *, concurrency=2, env_overrides=None,
+                      shutdown_signal=signal.SIGTERM, graceful_timeout=15):
+    """Context manager wrapper around :func:`spawn_runner`.
+
+    Guarantees cleanup of the spawned process even on test failure.
+    Logs subprocess stdout/stderr (tail-only) at info/warning level so
+    failures don't disappear into the void.
+    """
+    proc = spawn_runner(
+        db_name, concurrency=concurrency, env_overrides=env_overrides
+    )
+    try:
+        yield proc
+    finally:
+        stdout, stderr = terminate_runner(
+            proc, sig=shutdown_signal, graceful_timeout=graceful_timeout
+        )
+        if stdout:
+            tail = stdout[-4000:].decode("utf-8", errors="replace")
+            _logger.info("Runner pid=%s stdout (tail):\n%s", proc.pid, tail)
+        if stderr:
+            tail = stderr[-4000:].decode("utf-8", errors="replace")
+            _logger.warning("Runner pid=%s stderr (tail):\n%s", proc.pid, tail)
+
+
+def wait_for_started_count(registry, *, channel, minimum, timeout=30):
+    """Block until ``count(started)`` for ``channel`` reaches ``minimum``.
+
+    Returns the elapsed wall-clock seconds. Raises ``TimeoutError`` if
+    the threshold isn't reached. Use this to wait until the runner has
+    actually picked jobs up before driving the next test phase.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with registry.cursor() as cr:
+            cr.execute(
+                "SELECT COUNT(*) FROM queue_job "
+                "WHERE channel = %s AND state = 'started'",
+                (channel,),
+            )
+            count = cr.fetchone()[0]
+        if count >= minimum:
+            return time.monotonic() - (deadline - timeout)
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"channel {channel!r}: only saw {count} started jobs in {timeout}s "
+        f"(needed {minimum})"
+    )
+
+
+def wait_for_terminal_count(registry, *, channel, expected, timeout=120,
+                            poll_interval=0.2):
+    """Block until ``count(done+failed+cancelled)`` reaches ``expected``.
+
+    Returns the elapsed wall-clock seconds. Raises ``TimeoutError`` on
+    expiry. Returns immediately if already at expected.
+    """
+    deadline = time.monotonic() + timeout
+    start = time.monotonic()
+    while time.monotonic() < deadline:
+        with registry.cursor() as cr:
+            cr.execute(
+                "SELECT COUNT(*) FROM queue_job "
+                "WHERE channel = %s "
+                "  AND state IN ('done', 'failed', 'cancelled')",
+                (channel,),
+            )
+            count = cr.fetchone()[0]
+        if count >= expected:
+            return time.monotonic() - start
+        time.sleep(poll_interval)
+    raise TimeoutError(
+        f"channel {channel!r}: only {count} reached terminal in {timeout}s "
+        f"(needed {expected})"
+    )
+
+
+def sample_started_count(registry, *, channel):
+    """One-shot ``count(started)`` query for sampling loops (S4)."""
+    with registry.cursor() as cr:
+        cr.execute(
+            "SELECT COUNT(*) FROM queue_job "
+            "WHERE channel = %s AND state = 'started'",
+            (channel,),
+        )
+        return cr.fetchone()[0]
+
+
+def install_module(db_name, module_name):
+    """Install ``module_name`` into ``db_name`` via a one-shot odoo subprocess.
+
+    Used by Tier 2 scenarios that need ``job_worker_stress`` (sleep_for,
+    fail_always, retry helpers) installed in the test DB. Idempotent —
+    if the module is already installed odoo silently no-ops.
+    """
+    cfg = odoo.tools.config
+    addons_path = cfg["addons_path"]
+    if isinstance(addons_path, list):
+        addons_path = ",".join(addons_path)
+    argv = [
+        "odoo",
+        "-d",
+        db_name,
+        "--addons-path=" + addons_path,
+        "-i",
+        module_name,
+        "--stop-after-init",
+        "--log-level=warn",
+        "--without-demo=all",
+        "--workers=0",
+    ]
+    for key in ("db_host", "db_port", "db_user", "db_password"):
+        value = cfg.get(key)
+        if value:
+            argv.append(f"--{key}={value}")
+    _logger.info("Installing %s into %s", module_name, db_name)
+    result = subprocess.run(argv, capture_output=True, timeout=120, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to install {module_name} into {db_name}: "
+            f"stderr={result.stderr[-2000:].decode('utf-8', errors='replace')}"
+        )

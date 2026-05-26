@@ -32,3 +32,4 @@ from . import test_stress_s1_sustained_throughput
 from . import test_stress_s2_burst_under_depth
 from . import test_stress_s6_retry_storm
 from . import test_stress_s10_pg18_serialization
+from . import test_stress_s3_multi_worker
