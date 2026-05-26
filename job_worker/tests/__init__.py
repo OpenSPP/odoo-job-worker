@@ -28,3 +28,7 @@ from . import test_cancelled_state
 from . import test_field_aliases
 from . import test_related_action
 from . import test_timeout
+from . import test_stress_s1_sustained_throughput
+from . import test_stress_s2_burst_under_depth
+from . import test_stress_s6_retry_storm
+from . import test_stress_s10_pg18_serialization
