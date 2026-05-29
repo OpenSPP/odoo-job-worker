@@ -16,7 +16,7 @@ env:
 
 jobs:
   test:
-    name: Test ${{ matrix.module }}
+    name: Test ${{ matrix.module }} (PG ${{ matrix.pg_version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -24,10 +24,13 @@ jobs:
         module:
           - job_worker
           - job_worker_monitor
+        pg_version:
+          - "16"
+          - "18"
 
     services:
       postgres:
-        image: postgres:16-alpine
+        image: postgres:${{ matrix.pg_version }}-alpine
         env:
           POSTGRES_DB: test_ci
           POSTGRES_USER: odoo
