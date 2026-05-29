@@ -27,14 +27,7 @@ from .stress_common import (
     wait_for_terminal_count,
 )
 
-# NOTE: The design's S3 spec called for 2,000 jobs. At that scale workers
-# burst-process ~1150 jobs in ~1.5s then go silent and never resume, with
-# ~4-6 rows stuck in 'started' state. This is reproducible and looks like
-# a worker-pool / connection-pool deadlock that surfaces only above ~1500
-# jobs per channel. Likely a real bug; needs separate investigation.
-# 500 jobs at 4×4=16 effective slots reliably exercises multi-process
-# SKIP LOCKED contention (4 distinct worker_ids observed during the run).
-TOTAL_JOBS = 500
+TOTAL_JOBS = 2000
 WORKER_COUNT = 4
 CONCURRENCY_PER_WORKER = 4
 DRAIN_TIMEOUT_SECONDS = 120

@@ -255,6 +255,17 @@ def spawn_runner(
 
     Concurrency is set via ``QUEUE_JOB_CONCURRENCY`` env var, which
     ``QueueJobRunner.from_environ_or_config`` already reads.
+
+    stdout/stderr are redirected to ``tempfile.TemporaryFile`` instances
+    rather than ``subprocess.PIPE``. Using PIPE was the cause of the
+    worker-hangs-at-scale bug investigated in
+    ``test_diagnose_worker_hang.py``: Linux pipe buffers are ~64 KB, and
+    once filled (around ~72 jobs per pool slot at info-level logging
+    verbosity), the next ``_logger.info()`` call inside a pool thread
+    blocks on the pipe write — taking the logger module's internal lock
+    with it, deadlocking subsequent log calls on the same handler.
+    Temp files have no buffer limit; the parent reads them at terminate
+    time via the file descriptors stashed on the ``Popen`` object.
     """
     env = dict(os.environ)
     env["QUEUE_JOB_CONCURRENCY"] = str(int(concurrency))
@@ -265,20 +276,29 @@ def spawn_runner(
         env.update({k: str(v) for k, v in env_overrides.items()})
     argv = _runner_argv(db_name, runner_script=runner_script)
     _logger.info("Spawning runner: %s (concurrency=%d)", " ".join(argv), concurrency)
-    return subprocess.Popen(
+    import tempfile
+
+    stdout_file = tempfile.TemporaryFile()
+    stderr_file = tempfile.TemporaryFile()
+    proc = subprocess.Popen(
         argv,
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=stdout_file,
+        stderr=stderr_file,
     )
+    # Stash the file handles on the Popen object so terminate_runner can
+    # read them back. They are seeked + read on shutdown.
+    proc._stress_stdout_file = stdout_file
+    proc._stress_stderr_file = stderr_file
+    return proc
 
 
 def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15, kill_timeout=5):
     """Send ``sig`` to a runner subprocess and wait for exit.
 
-    Falls back to SIGKILL after ``graceful_timeout`` seconds. Drains
-    stdout/stderr to avoid orphaned pipes. Returns the captured (stdout,
-    stderr) bytes for diagnostics.
+    Falls back to SIGKILL after ``graceful_timeout`` seconds. Returns the
+    captured (stdout, stderr) bytes read from the temp files
+    ``spawn_runner`` stashed on the ``Popen`` object.
 
     Idempotent: safe to call on an already-exited process.
     """
@@ -288,7 +308,7 @@ def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15, kill_time
         except ProcessLookupError:
             pass
     try:
-        stdout, stderr = proc.communicate(timeout=graceful_timeout)
+        proc.wait(timeout=graceful_timeout)
     except subprocess.TimeoutExpired:
         _logger.warning(
             "Runner pid=%s did not exit on %s within %ds; sending SIGKILL",
@@ -298,11 +318,27 @@ def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15, kill_time
         )
         proc.kill()
         try:
-            stdout, stderr = proc.communicate(timeout=kill_timeout)
+            proc.wait(timeout=kill_timeout)
         except subprocess.TimeoutExpired:
             _logger.error("Runner pid=%s did not exit even on SIGKILL", proc.pid)
-            stdout, stderr = b"", b""
-    return stdout, stderr
+
+    def _drain(file_handle):
+        if file_handle is None:
+            return b""
+        try:
+            file_handle.seek(0)
+            data = file_handle.read()
+        finally:
+            try:
+                file_handle.close()
+            except Exception:
+                pass
+        return data or b""
+
+    return (
+        _drain(getattr(proc, "_stress_stdout_file", None)),
+        _drain(getattr(proc, "_stress_stderr_file", None)),
+    )
 
 
 @contextlib.contextmanager

@@ -38,3 +38,4 @@ from . import test_stress_s4_channel_concurrency
 from . import test_stress_s5_rate_limit
 from . import test_stress_s7_timeout_under_load
 from . import test_stress_s9_notify_flood
+from . import test_diagnose_worker_hang

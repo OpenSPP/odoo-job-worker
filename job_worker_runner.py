@@ -12,6 +12,8 @@ ModuleNotFoundError that occurs with ``python -m odoo.addons.job_worker.cli``.
 
 
 def main():
+    import faulthandler
+    import signal
     import sys
 
     from odoo.tools import config
@@ -20,6 +22,11 @@ def main():
     # args only reads odoo.conf and ignores CLI flags entirely; see
     # the docstring of odoo.tools.config.parse_config.
     config.parse_config(sys.argv[1:])
+
+    # SIGUSR1 dumps Python thread stacks to stderr. Cheap and runs in
+    # a signal context, so safe to leave enabled — useful for
+    # production debugging of stuck workers via `kill -USR1 <pid>`.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
 
     from odoo.addons.job_worker.cli.runner import QueueJobRunner
 
