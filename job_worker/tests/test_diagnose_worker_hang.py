@@ -58,9 +58,7 @@ class TestDiagnoseWorkerHang(TransactionCase):
         # own machinery, not the acquire SQL's COALESCE(limit, 1) trap.
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
-            env["queue.limit"].create(
-                {"name": channel, "limit": EFFECTIVE_SLOTS + 4}
-            )
+            env["queue.limit"].create({"name": channel, "limit": EFFECTIVE_SLOTS + 4})
             for _ in range(TOTAL_JOBS):
                 env["queue.job"].enqueue(
                     model_name="job.worker.stress.helper",
