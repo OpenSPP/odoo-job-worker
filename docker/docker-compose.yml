@@ -6,7 +6,11 @@ services:
       - POSTGRES_PASSWORD=odoo
       - POSTGRES_USER=odoo
     volumes:
-      - odoo-db-data:/var/lib/postgresql/data
+      # postgres:18+ requires the volume mounted at /var/lib/postgresql
+      # (not /var/lib/postgresql/data) so the image can place data in
+      # major-version-specific subdirectories for pg_upgrade.
+      # See https://github.com/docker-library/postgres/pull/1259
+      - odoo-db-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U odoo"]
       interval: 5s
