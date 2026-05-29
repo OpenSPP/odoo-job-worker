@@ -25,10 +25,10 @@ from odoo.tests.common import TransactionCase, tagged
 
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     pg_version,
     record_report,
     runner_subprocess,
+    setup_clean_queue,
     spawn_runner,
     terminate_runner,
     wait_for_started_count,
@@ -51,9 +51,7 @@ class TestS8aSigtermAbort(TransactionCase):
         super().setUp()
         if "job.worker.stress.helper" not in self.env:
             self.skipTest("job_worker_stress addon required for Tier 2")
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def test_s8a_sigterm_waits_for_in_flight_then_exits(self):
         channel = f"stress_s8a_{uuid.uuid4().hex[:8]}"
@@ -204,9 +202,7 @@ class TestS8bSigkillAbort(TransactionCase):
         super().setUp()
         if "job.worker.stress.helper" not in self.env:
             self.skipTest("job_worker_stress addon required for Tier 2")
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def test_s8b_sigkill_recovered_via_stale_heartbeat(self):
         channel = f"stress_s8b_{uuid.uuid4().hex[:8]}"

@@ -23,9 +23,9 @@ from odoo.tests.common import TransactionCase, tagged
 from ..cli.worker import _retry_db_operation, read_committed_cursor
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     pg_version,
     record_report,
+    setup_clean_queue,
 )
 
 TOTAL_JOBS = 200
@@ -40,9 +40,7 @@ JOBS_PER_THREAD = TOTAL_JOBS // THREAD_COUNT
 class TestS10Pg18SerializationStorm(TransactionCase):
     def setUp(self):
         super().setUp()
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def _seed_started_jobs(self, db, worker_id):
         """Insert TOTAL_JOBS rows directly in ``started`` state.
@@ -139,7 +137,9 @@ class TestS10Pg18SerializationStorm(TransactionCase):
 
         barrier = threading.Barrier(THREAD_COUNT)
         exceptions = []  # (thread_idx, job_id, exception)
-        retry_summary = {"attempts": 0}
+        # Per-thread counters: each thread writes only to its own slot,
+        # so no synchronisation is needed. Summed at end for the report.
+        attempts_per_thread = [0] * THREAD_COUNT
 
         def thread_body(idx, my_jobs):
             try:
@@ -155,13 +155,13 @@ class TestS10Pg18SerializationStorm(TransactionCase):
                             f"stress_s10_heartbeat_{job_id}",
                             max_retries=5,
                         )
-                        retry_summary["attempts"] += 1
+                        attempts_per_thread[idx] += 1
                     _retry_db_operation(
                         lambda jid=job_id: self._complete(db, jid, worker_id),
                         f"stress_s10_complete_{job_id}",
                         max_retries=5,
                     )
-                    retry_summary["attempts"] += 1
+                    attempts_per_thread[idx] += 1
                 except Exception as err:  # noqa: BLE001 — capture all
                     exceptions.append((idx, job_id, err))
 
@@ -194,16 +194,17 @@ class TestS10Pg18SerializationStorm(TransactionCase):
             self.assertEqual(done_count, TOTAL_JOBS)
             assert_queue_invariants(self, env, expected_total=TOTAL_JOBS)
 
+        total_ops = sum(attempts_per_thread)
         record_report(
             "S10",
             {
                 "jobs": {"seeded": TOTAL_JOBS, "done": done_count},
                 "threads": THREAD_COUNT,
                 "heartbeats_per_job": HEARTBEATS_PER_JOB,
-                "total_db_operations": retry_summary["attempts"],
+                "total_db_operations": total_ops,
                 "unhandled_exceptions": len(exceptions),
                 "elapsed_seconds": round(elapsed, 3),
-                "operations_per_sec": round(retry_summary["attempts"] / elapsed, 2)
+                "operations_per_sec": round(total_ops / elapsed, 2)
                 if elapsed > 0
                 else None,
                 "pg_version": pg_version(self.env.registry),

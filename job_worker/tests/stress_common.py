@@ -29,13 +29,46 @@ RUNNER_SCRIPT_DEFAULT = "/mnt/extra-addons/odoo-job-worker/job_worker_runner.py"
 
 
 def clear_queue(env):
-    """Drop every queue.job row. Use in setUp for stress scenarios.
+    """Drop every row from queue-related stress tables. Use in setUp.
 
     Stress tests own the queue exclusively; partial cleanup risks
     cross-scenario interference (e.g. a leftover ``started`` row from a
     crashed run blocks acquisition).
+
+    Several Tier 2 scenarios create ``queue.limit`` rows via an external
+    cursor + commit so a freshly-spawned worker subprocess can see
+    them. Those rows survive the TransactionCase rollback. S6 creates
+    rows in ``job.worker.stress.counter``. Clearing all three tables
+    here keeps them from accumulating across the full ``stress,tier2``
+    run.
+
+    The counter table only exists when the ``job_worker_stress`` addon
+    is installed; gate on registry membership so Tier 1 scenarios that
+    do not install the addon are still able to call this helper.
     """
     env["queue.job"].search([]).unlink()
+    env["queue.limit"].search([]).unlink()
+    if "job.worker.stress.counter" in env:
+        env["job.worker.stress.counter"].search([]).unlink()
+
+
+def setup_clean_queue(testcase):
+    """Clear queue tables now, and re-clear at end of test.
+
+    Idiomatic for stress test ``setUp``: clears any leftover state from a
+    prior (possibly crashed) test, and registers an ``addCleanup`` that
+    runs after the current test body to wipe the rows this test
+    committed via external cursors. Without the cleanup, the last test
+    in each session leaves its queue.limit row behind.
+    """
+
+    def _clear():
+        with testcase.env.registry.cursor() as cr:
+            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
+            cr.commit()
+
+    _clear()
+    testcase.addCleanup(_clear)
 
 
 def percentile(values, pct):

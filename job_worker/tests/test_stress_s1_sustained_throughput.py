@@ -16,10 +16,10 @@ from odoo.tests.common import TransactionCase, tagged
 
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     percentile,
     pg_version,
     record_report,
+    setup_clean_queue,
 )
 
 TOTAL_JOBS = 5000
@@ -30,9 +30,7 @@ CHUNK_SIZE = 100
 class TestS1SustainedThroughput(TransactionCase):
     def setUp(self):
         super().setUp()
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def test_s1_sustained_throughput_5000_jobs(self):
         channel = f"stress_s1_{uuid.uuid4().hex[:8]}"

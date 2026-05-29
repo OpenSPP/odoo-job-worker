@@ -20,10 +20,10 @@ from odoo.tests.common import TransactionCase, tagged
 
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     percentile,
     pg_version,
     record_report,
+    setup_clean_queue,
 )
 
 CHANNELS = 10
@@ -90,9 +90,7 @@ FOR UPDATE SKIP LOCKED
 class TestS2BurstUnderDepth(TransactionCase):
     def setUp(self):
         super().setUp()
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def _enqueue(self, env, channel, count):
         domain = [("id", "=", SUPERUSER_ID)]

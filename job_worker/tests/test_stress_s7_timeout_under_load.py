@@ -16,10 +16,10 @@ from odoo.tests.common import TransactionCase, tagged
 
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     pg_version,
     record_report,
     runner_subprocess,
+    setup_clean_queue,
     wait_for_terminal_count,
 )
 
@@ -48,9 +48,7 @@ class TestS7TimeoutUnderLoad(TransactionCase):
         super().setUp()
         if "job.worker.stress.helper" not in self.env:
             self.skipTest("job_worker_stress addon required for Tier 2")
-        with self.env.registry.cursor() as cr:
-            clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
-            cr.commit()
+        setup_clean_queue(self)
 
     def test_s7_timeout_kicks_in_under_load(self):
         channel = f"stress_s7_{uuid.uuid4().hex[:8]}"

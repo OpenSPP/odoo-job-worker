@@ -18,9 +18,9 @@ from odoo.tests.common import TransactionCase, tagged
 
 from .stress_common import (
     assert_queue_invariants,
-    clear_queue,
     pg_version,
     record_report,
+    setup_clean_queue,
 )
 
 TOTAL_JOBS = 500
@@ -36,11 +36,7 @@ class TestS6RetryStorm(TransactionCase):
                 "job_worker_stress addon not installed — install it to run "
                 "stress scenarios that need test-only job bodies"
             )
-        with self.env.registry.cursor() as cr:
-            env = api.Environment(cr, SUPERUSER_ID, {})
-            clear_queue(env)
-            env["job.worker.stress.counter"].search([]).unlink()
-            cr.commit()
+        setup_clean_queue(self)
 
     def test_s6_retry_storm_500_jobs(self):
         run_token = uuid.uuid4().hex[:8]
