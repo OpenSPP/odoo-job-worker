@@ -1,12 +1,16 @@
 """Stress S8a/S8b — Abort during execution (Tier 2).
 
-S8a: Graceful shutdown via SIGTERM. In-flight jobs go back to ``pending``
-with worker_id/heartbeat/started_at cleared, attempts NOT incremented.
-A subsequent worker picks them up and they reach ``done``.
+S8a — Graceful shutdown via SIGTERM. Per ``docs/deployment.md``: the
+runner finishes running jobs, then exits. In-flight jobs are allowed
+to complete naturally and end in ``done``; queued-but-not-started
+jobs stay in ``pending``. A subsequent worker picks the pending ones
+up. There is no auto-release back to pending on SIGTERM — operators
+who need to stop quickly for a long-running job must use SIGKILL,
+which S8b covers via the stale-heartbeat reclaim path.
 
-S8b: Hard kill via SIGKILL. In-flight rows stay 'started' with stale
-heartbeat. After ``stale_after_seconds + ε``, a new worker reclaims
-them via the heartbeat-stale path and they reach ``done``.
+S8b — Hard kill via SIGKILL. In-flight rows stay 'started' with stale
+heartbeat. After ``stale_after_seconds`` (default 60s), a new worker
+reclaims them via the acquire-stale path and they reach ``done``.
 
 Depends on ``job_worker_stress`` (sleep_for body). Tagged ``tier2``;
 opt-in via ``--test-tags=tier2``.
@@ -33,9 +37,12 @@ from .stress_common import (
 
 TOTAL_JOBS = 20
 CONCURRENCY = 4
-# Long enough that the test process can win the race to SIGTERM before any
-# job naturally completes. 30s matches the design.
-SLEEP_SECONDS = 30
+# 3s is short enough that the test finishes quickly while still being
+# long enough that the test process can win the race to send SIGTERM
+# before any in-flight job naturally completes.
+SLEEP_SECONDS = 3
+# Generous: SIGTERM → wait_for_in_flight (~3s) → process exit + reads.
+SHUTDOWN_TIMEOUT = 30
 
 
 @tagged("post_install", "-at_install", "-standard", "tier2")
@@ -48,10 +55,9 @@ class TestS8aSigtermAbort(TransactionCase):
             clear_queue(api.Environment(cr, SUPERUSER_ID, {}))
             cr.commit()
 
-    def test_s8a_sigterm_returns_in_flight_to_pending(self):
+    def test_s8a_sigterm_waits_for_in_flight_then_exits(self):
         channel = f"stress_s8a_{uuid.uuid4().hex[:8]}"
 
-        # Channel limit ≥ concurrency so the worker can fill all 4 slots.
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
             env["queue.limit"].create({"name": channel, "limit": CONCURRENCY + 4})
@@ -66,8 +72,9 @@ class TestS8aSigtermAbort(TransactionCase):
                 )
             cr.commit()
 
-        # Phase 1: spawn one worker with concurrency=4, wait until 4
-        # rows reach 'started' state, then SIGTERM.
+        # Phase 1: spawn one worker, wait until 4 rows are 'started',
+        # then SIGTERM. The shutdown contract (deployment.md) is that
+        # the runner waits for running jobs to finish, then exits.
         proc = spawn_runner(
             self.env.cr.dbname,
             concurrency=CONCURRENCY,
@@ -78,9 +85,6 @@ class TestS8aSigtermAbort(TransactionCase):
                 self.env.registry, channel=channel, minimum=CONCURRENCY,
                 timeout=30,
             )
-            # Capture the worker_id used by the in-flight jobs so we can
-            # later assert that the next worker (different uuid) is the
-            # one that completes them.
             with self.env.registry.cursor() as cr:
                 cr.execute(
                     "SELECT DISTINCT worker_id FROM queue_job "
@@ -96,79 +100,60 @@ class TestS8aSigtermAbort(TransactionCase):
             first_worker_id = next(iter(first_worker_ids))
         finally:
             shutdown_started = time.monotonic()
-            terminate_runner(proc, sig=signal.SIGTERM, graceful_timeout=10)
+            terminate_runner(
+                proc, sig=signal.SIGTERM, graceful_timeout=SHUTDOWN_TIMEOUT,
+            )
             shutdown_elapsed = time.monotonic() - shutdown_started
 
-        # Phase 2: assert state immediately after shutdown.
+        # Phase 2: assert that the SIGTERM honoured the documented
+        # contract — in-flight jobs ran to completion.
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
-            states = {
-                row[0]: row[1]
-                for row in env.cr.execute(
-                    "SELECT state, COUNT(*) FROM queue_job "
-                    "WHERE channel = %s GROUP BY state",
-                    (channel,),
-                ) or env.cr.fetchall()
-            }
-            # The execute() above returns None in some Odoo versions; use
-            # fetchall directly.
-            env.cr.execute(
+            cr.execute(
                 "SELECT state, COUNT(*) FROM queue_job "
                 "WHERE channel = %s GROUP BY state",
                 (channel,),
             )
-            states = {row[0]: row[1] for row in env.cr.fetchall()}
+            states = {row[0]: row[1] for row in cr.fetchall()}
 
-            stuck_started = states.get("started", 0)
-            self.assertEqual(
-                stuck_started,
-                0,
-                f"expected 0 'started' rows post-SIGTERM, found {stuck_started} "
-                f"(in-flight should have been released to pending). "
-                f"Full breakdown: {states}",
-            )
+        # No row left mid-flight: documented contract is that the
+        # runner waits before exiting, so 'started' must be empty.
+        self.assertEqual(
+            states.get("started", 0),
+            0,
+            f"expected 0 'started' rows after graceful shutdown, found "
+            f"{states.get('started', 0)}. Full breakdown: {states}",
+        )
+        # The 4 that were in-flight should have completed; the other
+        # 16 should still be pending (they were never acquired).
+        self.assertGreaterEqual(
+            states.get("done", 0),
+            CONCURRENCY,
+            f"expected at least {CONCURRENCY} done after graceful "
+            f"shutdown (in-flight jobs allowed to finish). Breakdown: {states}",
+        )
+        # And shutdown should complete reasonably quickly — bounded by
+        # the longest in-flight sleep + a few seconds for the runner's
+        # poll loop and pool teardown.
+        self.assertLess(
+            shutdown_elapsed,
+            SLEEP_SECONDS + 15,
+            f"shutdown took {shutdown_elapsed:.1f}s — slower than "
+            f"expected (~{SLEEP_SECONDS + 5}s for in-flight sleep + "
+            f"teardown overhead)",
+        )
 
-            pending = states.get("pending", 0)
-            self.assertGreaterEqual(
-                pending,
-                TOTAL_JOBS - states.get("done", 0),
-                f"pending count too low: {states}",
-            )
-
-            # Released-to-pending jobs must have worker_id/heartbeat/
-            # started_at cleared AND attempts not incremented.
-            env.cr.execute(
-                "SELECT id, worker_id, heartbeat, started_at, attempts "
-                "FROM queue_job "
-                "WHERE channel = %s AND state = 'pending' AND attempts > 0",
-                (channel,),
-            )
-            dirty = env.cr.fetchall()
-            self.assertFalse(
-                dirty,
-                f"released-to-pending rows must have attempts == 0; "
-                f"found dirty rows: {dirty[:5]}",
-            )
-
-        # Phase 3: spawn a fresh worker (different worker_uuid). The
-        # released jobs should be acquirable and reach 'done'. Use a
-        # short sleep body for this phase via lowering SLEEP via env var
-        # is not possible — but the released jobs still call sleep_for(30).
-        # So we just verify they get re-acquired (started → done is too
-        # slow at 30s); we shorten by lowering scope to "do they get
-        # acquired" rather than "do they finish".
+        # Phase 3: spawn a fresh worker and assert it picks up the
+        # remaining pending jobs and drains them to done.
         with runner_subprocess(
             self.env.cr.dbname,
             concurrency=CONCURRENCY,
             env_overrides={"QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK": "0"},
         ):
-            try:
-                wait_for_started_count(
-                    self.env.registry, channel=channel,
-                    minimum=1, timeout=30,
-                )
-            except TimeoutError as err:
-                self.fail(f"second worker did not pick up released jobs: {err}")
+            drain_elapsed = wait_for_terminal_count(
+                self.env.registry, channel=channel,
+                expected=TOTAL_JOBS, timeout=60,
+            )
             with self.env.registry.cursor() as cr:
                 cr.execute(
                     "SELECT DISTINCT worker_id FROM queue_job "
@@ -176,38 +161,25 @@ class TestS8aSigtermAbort(TransactionCase):
                     (channel,),
                 )
                 second_worker_ids = {row[0] for row in cr.fetchall()}
-            self.assertTrue(
-                second_worker_ids and first_worker_id not in second_worker_ids,
-                f"expected new worker to pick up jobs; "
-                f"first={first_worker_id}, second={second_worker_ids}",
-            )
 
-        # The second worker is now terminated. The jobs it had in flight
-        # will themselves be released back to pending (by our shutdown
-        # path). For invariant-checking purposes we accept any of
-        # done/pending — the contract under test is "no stuck started".
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
-            env.cr.execute(
-                "SELECT state, COUNT(*) FROM queue_job WHERE channel = %s "
-                "GROUP BY state",
-                (channel,),
+            done = env["queue.job"].search_count(
+                [("channel", "=", channel), ("state", "=", "done")]
             )
-            final_states = {row[0]: row[1] for row in env.cr.fetchall()}
-            self.assertEqual(
-                final_states.get("started", 0),
-                0,
-                f"no jobs should be stuck started; final: {final_states}",
-            )
+            self.assertEqual(done, TOTAL_JOBS)
+            assert_queue_invariants(self, env, expected_total=TOTAL_JOBS)
 
         record_report(
             "S8a",
             {
-                "jobs": {"enqueued": TOTAL_JOBS, **final_states},
+                "jobs": {"enqueued": TOTAL_JOBS, "done": done},
                 "concurrency": CONCURRENCY,
+                "post_sigterm_state": states,
                 "first_worker_id": first_worker_id,
-                "second_worker_ids": list(second_worker_ids),
+                "second_worker_ids": list(second_worker_ids - {first_worker_id}),
                 "shutdown_seconds": round(shutdown_elapsed, 3),
+                "recovery_drain_seconds": round(drain_elapsed, 3),
                 "pg_version": pg_version(self.env.registry),
             },
         )
@@ -216,10 +188,11 @@ class TestS8aSigtermAbort(TransactionCase):
 @tagged("post_install", "-at_install", "-standard", "tier2")
 class TestS8bSigkillAbort(TransactionCase):
     """SIGKILL leaves rows in 'started' with stale heartbeat; another
-    worker reclaims them after stale_after_seconds."""
+    worker reclaims them after stale_after_seconds.
 
-    # Shorter than default 60s so the test finishes in reasonable time.
-    STALE_AFTER_SECONDS = 5
+    This is the recommended escape hatch when SIGTERM would block for
+    too long on a long-running in-flight job.
+    """
 
     def setUp(self):
         super().setUp()
@@ -232,9 +205,6 @@ class TestS8bSigkillAbort(TransactionCase):
     def test_s8b_sigkill_recovered_via_stale_heartbeat(self):
         channel = f"stress_s8b_{uuid.uuid4().hex[:8]}"
 
-        # Use sleep(2) so jobs are short enough for the test to terminate
-        # within reason, but long enough that the SIGKILL catches them
-        # mid-flight.
         job_sleep = 2
 
         with self.env.registry.cursor() as cr:
@@ -270,8 +240,8 @@ class TestS8bSigkillAbort(TransactionCase):
             )
 
         # Phase 2: immediately after SIGKILL, some rows are still
-        # 'started' with stale-ish heartbeats. They cannot be cleaned up
-        # without the worker's cooperation (SIGKILL gave none).
+        # 'started' with stale-ish heartbeats — the worker had no
+        # chance to clean them up.
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
             env.cr.execute(
@@ -286,21 +256,14 @@ class TestS8bSigkillAbort(TransactionCase):
             f"expected some 'started' rows after SIGKILL, got {stuck_after_kill}",
         )
 
-        # Phase 3: spawn a recovery worker with a short stale_after.
-        # Stale-reclaim path should move jobs back to acquirable state
+        # Phase 3: spawn a recovery worker. Stale-heartbeat reclaim
+        # path (default 60s) should move jobs back to acquirable state
         # and they should complete.
         with runner_subprocess(
             self.env.cr.dbname,
             concurrency=CONCURRENCY,
             env_overrides={
                 "QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK": "0",
-                # Note: the runner doesn't expose stale_after_seconds via
-                # env var. The default is 60s — but stale check looks at
-                # heartbeat freshness, and the killed worker stopped
-                # updating heartbeat immediately. After 60s a fresh
-                # worker reclaims via the existing acquire_job_lock
-                # stale path. For test time budget we set a generous
-                # drain timeout.
             },
         ):
             drain_elapsed = wait_for_terminal_count(

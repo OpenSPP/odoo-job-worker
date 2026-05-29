@@ -196,60 +196,7 @@ class QueueWorker:
                             notify = conn.notifies.pop(0)
                             _logger.debug("Received notification: %s", notify.channel)
         finally:
-            # Graceful shutdown semantics: in-flight jobs go back to
-            # pending so another worker can pick them up immediately,
-            # rather than the previous "wait for them to finish" which
-            # could block shutdown for as long as the longest sleep.
-            #
-            # Race window: a pool thread that is mid-finalize_job could
-            # overwrite this back to 'done' before the process exits.
-            # That's acceptable — the job was completing anyway. The
-            # finalize SQL is row-level-locked and serialised by PG, so
-            # we cannot end up with both 'pending' and 'done' set
-            # simultaneously; whichever transaction commits last wins.
-            with self._active_lock:
-                in_flight = list(self.active_job_ids)
-            if in_flight:
-                self._release_in_flight_on_shutdown(in_flight)
-            self._pool.shutdown(wait=False, cancel_futures=True)
-
-    def _release_in_flight_on_shutdown(self, job_ids):
-        """Mark in-flight jobs back to pending during graceful shutdown.
-
-        Filters by ``worker_id = self.worker_uuid AND state = 'started'``
-        so we never touch jobs that:
-        - have already been finalized to 'done' by their pool thread
-          (worker_id was cleared by finalize_job), or
-        - were reclaimed as stale by another worker (worker_id changed).
-
-        Failures are logged but never re-raised — the worker is shutting
-        down and there is nothing more to do.
-        """
-        try:
-            with read_committed_cursor(self.db) as cr:
-                cr.execute(
-                    "UPDATE queue_job"
-                    "   SET state = 'pending',"
-                    "       worker_id = NULL,"
-                    "       heartbeat = NULL,"
-                    "       started_at = NULL,"
-                    "       write_date = NOW()"
-                    " WHERE id = ANY(%s)"
-                    "   AND worker_id = %s"
-                    "   AND state = 'started'",
-                    (job_ids, self.worker_uuid),
-                )
-                released = cr.rowcount
-                cr.execute("NOTIFY queue_job_wake_up")
-                cr.commit()
-            _logger.info(
-                "Graceful shutdown released %d in-flight job(s) back to pending",
-                released,
-            )
-        except Exception:
-            _logger.exception(
-                "Failed to release in-flight jobs on graceful shutdown"
-            )
+            self._pool.shutdown(wait=True, cancel_futures=True)
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def update_heartbeats(self):
