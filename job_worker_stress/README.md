@@ -15,10 +15,6 @@ When you want to run the `stress` or `tier2` test tags. Those scenarios
 need job bodies that sleep, fail, or fail-then-succeed on demand — the
 stress addon provides them via stable model methods.
 
-Tier 1 scenarios S1, S2, S10 do **not** need this addon (they call
-`res.users.search`); S6 does. All Tier 2 scenarios (S3, S4, S5, S7,
-S8a, S8b, S9) need it.
-
 Install alongside `job_worker`:
 
 ```bash
@@ -31,6 +27,32 @@ docker compose -f docker/docker-compose.yml run --rm odoo odoo \
   --stop-after-init \
   -i job_worker,job_worker_stress
 ```
+
+## The stress scenarios
+
+Each scenario lives in its own test file under
+`job_worker/tests/test_stress_*.py`. Scenarios are tagged into two
+tiers:
+
+- **Tier 1 (`stress`)** — `TransactionCase` tests, no subprocesses,
+  fast. Run with `--test-tags=stress`.
+- **Tier 2 (`tier2`)** — spawn real `job_worker_runner.py` subprocesses
+  via `subprocess.Popen` to get genuine multi-process behaviour. Slow
+  (workers boot Odoo). Run with `--test-tags=tier2`.
+
+| ID | Tier | Needs this addon? | What it tests |
+|---|---|---|---|
+| **S1** | 1 | no | Sustained throughput: 5,000 trivial jobs drained via batched `run_now()`. Reports chunk-latency percentiles. |
+| **S2** | 1 | no | Burst enqueue under depth: 10k pre-fill across 10 channels + 1k burst, plus `EXPLAIN ANALYZE` of the worker's `acquire_job_lock` SQL at 11k depth. Catches missing-index regressions. |
+| **S3** | 2 | yes (`sleep_for`) | Multi-worker contention: 4 real worker subprocesses (advisory lock disabled) × concurrency=4 against 500 jobs. Asserts > 1 distinct `worker_id` live to prove inter-process `SKIP LOCKED` is exercised. |
+| **S4** | 2 | yes (`sleep_for`) | Channel concurrency limit: `queue.limit.limit = 2` against 16 effective slots. Live-samples `count(state='started')` every 50 ms and asserts the observed peak vs. the limit (with overshoot tolerance — the acquire path has a TOCTOU window). |
+| **S5** | 2 | yes (`sleep_for`) | Channel rate limit: `rate_limit = 10` against 100 jobs. Asserts drain time is bounded below by `(jobs / rate_limit) × 0.8`. Reports observed peak RPS. |
+| **S6** | 1 | yes (`retry_once_then_succeed`) | Retry storm: 500 jobs that raise `RetryableJobError(seconds=0)` on the first attempt and succeed on the second. Asserts sum of `attempts` field == 500 (i.e. exactly one retry per job — `attempts` only increments on retry, not on success). |
+| **S7** | 2 | yes (`sleep_for`) | Timeout enforcement under load: jobs sleep longer than the worker's heartbeat interval (15 s default), so the heartbeat tick detects `timeout=1s` and the job ends in `failed` with `TimeoutJobError` in `exc_info`. |
+| **S8a** | 2 | yes (`sleep_for`) | SIGTERM graceful shutdown: verifies the documented contract (`docs/deployment.md`) that the runner finishes in-flight jobs before exiting. In-flight rows reach `done`; queued-but-not-started rows stay `pending`. |
+| **S8b** | 2 | yes (`sleep_for`) | SIGKILL hard kill: worker has no chance to clean up. In-flight rows stay `started` with frozen heartbeat. A fresh worker reclaims via the stale-heartbeat path (default 60 s) and they reach `done`. |
+| **S9** | 2 | yes (`sleep_for`) | NOTIFY/LISTEN pickup latency under flood: worker parks on `select()`, then 200 jobs are enqueued in a tight loop (each commit fires `NOTIFY queue_job_wake_up`). Reports p50/p95/p99 of `started_at - create_date`. |
+| **S10** | 1 | no | PG18 serialization storm: 200 jobs pre-set to `state='started'`, then 10 threads drive simultaneous heartbeat + completion `UPDATE`s through `_retry_db_operation` to verify the retry wrapper absorbs PG's serialization failures at volume. |
 
 ## What's inside
 
