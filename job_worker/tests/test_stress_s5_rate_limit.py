@@ -17,7 +17,6 @@ opt-in via ``--test-tags=tier2``.
 """
 
 import threading
-import time
 import uuid
 from collections import deque
 
@@ -56,11 +55,13 @@ class TestS5RateLimit(TransactionCase):
 
         with self.env.registry.cursor() as cr:
             env = api.Environment(cr, SUPERUSER_ID, {})
-            env["queue.limit"].create({
-                "name": channel,
-                "limit": CHANNEL_LIMIT,
-                "rate_limit": CHANNEL_RATE_LIMIT,
-            })
+            env["queue.limit"].create(
+                {
+                    "name": channel,
+                    "limit": CHANNEL_LIMIT,
+                    "rate_limit": CHANNEL_RATE_LIMIT,
+                }
+            )
             for _ in range(TOTAL_JOBS):
                 env["queue.job"].enqueue(
                     model_name="job.worker.stress.helper",
@@ -95,7 +96,6 @@ class TestS5RateLimit(TransactionCase):
                 except Exception:  # noqa: BLE001
                     pass
 
-        start = time.monotonic()
         with runner_subprocess(
             self.env.cr.dbname,
             concurrency=CONCURRENCY,
@@ -114,7 +114,6 @@ class TestS5RateLimit(TransactionCase):
             finally:
                 sampler_stop.set()
                 sampler.join(timeout=2)
-        total_elapsed = time.monotonic() - start
 
         # Compute observed peak RPS from started_at distribution.
         with self.env.registry.cursor() as cr:
@@ -166,6 +165,7 @@ class TestS5RateLimit(TransactionCase):
         if not timestamps:
             return 0
         from datetime import timedelta
+
         ordered = sorted(timestamps)
         window = deque()
         peak = 0

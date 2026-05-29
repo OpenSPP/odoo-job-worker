@@ -21,8 +21,8 @@ from odoo.tests.common import TransactionCase, tagged
 from .stress_common import (
     assert_queue_invariants,
     clear_queue,
-    pg_version,
     percentile,
+    pg_version,
     record_report,
 )
 
@@ -182,9 +182,7 @@ class TestS2BurstUnderDepth(TransactionCase):
                 count = env["queue.job"].search_count(
                     [("channel", "=", channel), ("state", "=", "done")]
                 )
-                self.assertGreater(
-                    count, 0, f"channel {channel} had zero done jobs"
-                )
+                self.assertGreater(count, 0, f"channel {channel} had zero done jobs")
 
         record_report(
             "S2",

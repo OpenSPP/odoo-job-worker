@@ -151,13 +151,13 @@ class TestS10Pg18SerializationStorm(TransactionCase):
                 try:
                     for _ in range(HEARTBEATS_PER_JOB):
                         _retry_db_operation(
-                            lambda: self._heartbeat(db, job_id, worker_id),
+                            lambda jid=job_id: self._heartbeat(db, jid, worker_id),
                             f"stress_s10_heartbeat_{job_id}",
                             max_retries=5,
                         )
                         retry_summary["attempts"] += 1
                     _retry_db_operation(
-                        lambda: self._complete(db, job_id, worker_id),
+                        lambda jid=job_id: self._complete(db, jid, worker_id),
                         f"stress_s10_complete_{job_id}",
                         max_retries=5,
                     )
@@ -166,9 +166,7 @@ class TestS10Pg18SerializationStorm(TransactionCase):
                     exceptions.append((idx, job_id, err))
 
         threads = [
-            threading.Thread(
-                target=thread_body, args=(idx, partition), daemon=True
-            )
+            threading.Thread(target=thread_body, args=(idx, partition), daemon=True)
             for idx, partition in enumerate(partitions)
         ]
         started_at = time.monotonic()
@@ -179,9 +177,7 @@ class TestS10Pg18SerializationStorm(TransactionCase):
         elapsed = time.monotonic() - started_at
 
         for t in threads:
-            self.assertFalse(
-                t.is_alive(), "thread did not finish within timeout"
-            )
+            self.assertFalse(t.is_alive(), "thread did not finish within timeout")
 
         # Hard assertions: zero unhandled exceptions, every job done.
         self.assertFalse(
@@ -207,9 +203,9 @@ class TestS10Pg18SerializationStorm(TransactionCase):
                 "total_db_operations": retry_summary["attempts"],
                 "unhandled_exceptions": len(exceptions),
                 "elapsed_seconds": round(elapsed, 3),
-                "operations_per_sec": round(
-                    retry_summary["attempts"] / elapsed, 2
-                ) if elapsed > 0 else None,
+                "operations_per_sec": round(retry_summary["attempts"] / elapsed, 2)
+                if elapsed > 0
+                else None,
                 "pg_version": pg_version(self.env.registry),
             },
         )

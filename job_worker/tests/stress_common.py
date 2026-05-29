@@ -16,7 +16,7 @@ import os
 import signal
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import odoo
 from odoo import SUPERUSER_ID, api
@@ -25,9 +25,7 @@ _logger = logging.getLogger(__name__)
 
 # Location of the standalone runner script inside the container. The
 # repo is bind-mounted into the test image at /mnt/extra-addons.
-RUNNER_SCRIPT_DEFAULT = (
-    "/mnt/extra-addons/odoo-job-worker/job_worker_runner.py"
-)
+RUNNER_SCRIPT_DEFAULT = "/mnt/extra-addons/odoo-job-worker/job_worker_runner.py"
 
 
 def clear_queue(env):
@@ -70,14 +68,11 @@ def assert_queue_invariants(testcase, env, expected_total):
     - no duplicate identity_key in (waiting, pending, started)
     """
     QueueJob = env["queue.job"]
-    terminal = QueueJob.search_count(
-        [("state", "in", ["done", "failed", "cancelled"])]
-    )
+    terminal = QueueJob.search_count([("state", "in", ["done", "failed", "cancelled"])])
     testcase.assertEqual(
         terminal,
         expected_total,
-        f"Invariant: terminal-state count ({terminal}) "
-        f"!= expected ({expected_total})",
+        f"Invariant: terminal-state count ({terminal}) != expected ({expected_total})",
     )
     stuck_started = QueueJob.search_count([("state", "=", "started")])
     testcase.assertEqual(
@@ -124,7 +119,7 @@ def _run_dir():
     """
     global _run_timestamp
     if _run_timestamp is None:
-        _run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        _run_timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return os.path.join(_reports_root(), _run_timestamp)
 
 
@@ -136,9 +131,7 @@ def record_report(scenario, data):
     """
     payload = dict(data)
     payload.setdefault("scenario", scenario)
-    payload.setdefault(
-        "recorded_at", datetime.now(timezone.utc).isoformat()
-    )
+    payload.setdefault("recorded_at", datetime.now(UTC).isoformat())
     # Compact JSON for the log line so the entire report stays on a single
     # line and survives Odoo's log formatter. Pretty-printed JSON goes to
     # the file artifact for human consumption.
@@ -218,8 +211,9 @@ def _runner_argv(db_name, runner_script=RUNNER_SCRIPT_DEFAULT):
     return argv
 
 
-def spawn_runner(db_name, *, concurrency=2, env_overrides=None,
-                 runner_script=RUNNER_SCRIPT_DEFAULT):
+def spawn_runner(
+    db_name, *, concurrency=2, env_overrides=None, runner_script=RUNNER_SCRIPT_DEFAULT
+):
     """Spawn the real ``job_worker_runner.py`` as a subprocess.
 
     Returns a ``subprocess.Popen``. Caller is responsible for terminating
@@ -246,8 +240,7 @@ def spawn_runner(db_name, *, concurrency=2, env_overrides=None,
     )
 
 
-def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15,
-                     kill_timeout=5):
+def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15, kill_timeout=5):
     """Send ``sig`` to a runner subprocess and wait for exit.
 
     Falls back to SIGKILL after ``graceful_timeout`` seconds. Drains
@@ -280,17 +273,21 @@ def terminate_runner(proc, *, sig=signal.SIGTERM, graceful_timeout=15,
 
 
 @contextlib.contextmanager
-def runner_subprocess(db_name, *, concurrency=2, env_overrides=None,
-                      shutdown_signal=signal.SIGTERM, graceful_timeout=15):
+def runner_subprocess(
+    db_name,
+    *,
+    concurrency=2,
+    env_overrides=None,
+    shutdown_signal=signal.SIGTERM,
+    graceful_timeout=15,
+):
     """Context manager wrapper around :func:`spawn_runner`.
 
     Guarantees cleanup of the spawned process even on test failure.
     Logs subprocess stdout/stderr (tail-only) at info/warning level so
     failures don't disappear into the void.
     """
-    proc = spawn_runner(
-        db_name, concurrency=concurrency, env_overrides=env_overrides
-    )
+    proc = spawn_runner(db_name, concurrency=concurrency, env_overrides=env_overrides)
     try:
         yield proc
     finally:
@@ -330,8 +327,9 @@ def wait_for_started_count(registry, *, channel, minimum, timeout=30):
     )
 
 
-def wait_for_terminal_count(registry, *, channel, expected, timeout=120,
-                            poll_interval=0.2):
+def wait_for_terminal_count(
+    registry, *, channel, expected, timeout=120, poll_interval=0.2
+):
     """Block until ``count(done+failed+cancelled)`` reaches ``expected``.
 
     Returns the elapsed wall-clock seconds. Raises ``TimeoutError`` on
@@ -361,8 +359,7 @@ def sample_started_count(registry, *, channel):
     """One-shot ``count(started)`` query for sampling loops (S4)."""
     with registry.cursor() as cr:
         cr.execute(
-            "SELECT COUNT(*) FROM queue_job "
-            "WHERE channel = %s AND state = 'started'",
+            "SELECT COUNT(*) FROM queue_job WHERE channel = %s AND state = 'started'",
             (channel,),
         )
         return cr.fetchone()[0]

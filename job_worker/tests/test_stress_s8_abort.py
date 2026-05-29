@@ -82,7 +82,9 @@ class TestS8aSigtermAbort(TransactionCase):
         )
         try:
             wait_for_started_count(
-                self.env.registry, channel=channel, minimum=CONCURRENCY,
+                self.env.registry,
+                channel=channel,
+                minimum=CONCURRENCY,
                 timeout=30,
             )
             with self.env.registry.cursor() as cr:
@@ -101,7 +103,9 @@ class TestS8aSigtermAbort(TransactionCase):
         finally:
             shutdown_started = time.monotonic()
             terminate_runner(
-                proc, sig=signal.SIGTERM, graceful_timeout=SHUTDOWN_TIMEOUT,
+                proc,
+                sig=signal.SIGTERM,
+                graceful_timeout=SHUTDOWN_TIMEOUT,
             )
             shutdown_elapsed = time.monotonic() - shutdown_started
 
@@ -151,8 +155,10 @@ class TestS8aSigtermAbort(TransactionCase):
             env_overrides={"QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK": "0"},
         ):
             drain_elapsed = wait_for_terminal_count(
-                self.env.registry, channel=channel,
-                expected=TOTAL_JOBS, timeout=60,
+                self.env.registry,
+                channel=channel,
+                expected=TOTAL_JOBS,
+                timeout=60,
             )
             with self.env.registry.cursor() as cr:
                 cr.execute(
@@ -231,12 +237,17 @@ class TestS8bSigkillAbort(TransactionCase):
         )
         try:
             wait_for_started_count(
-                self.env.registry, channel=channel,
-                minimum=CONCURRENCY, timeout=30,
+                self.env.registry,
+                channel=channel,
+                minimum=CONCURRENCY,
+                timeout=30,
             )
         finally:
             terminate_runner(
-                proc, sig=signal.SIGKILL, graceful_timeout=2, kill_timeout=5,
+                proc,
+                sig=signal.SIGKILL,
+                graceful_timeout=2,
+                kill_timeout=5,
             )
 
         # Phase 2: immediately after SIGKILL, some rows are still
@@ -267,8 +278,10 @@ class TestS8bSigkillAbort(TransactionCase):
             },
         ):
             drain_elapsed = wait_for_terminal_count(
-                self.env.registry, channel=channel,
-                expected=TOTAL_JOBS, timeout=120,
+                self.env.registry,
+                channel=channel,
+                expected=TOTAL_JOBS,
+                timeout=120,
             )
 
         with self.env.registry.cursor() as cr:

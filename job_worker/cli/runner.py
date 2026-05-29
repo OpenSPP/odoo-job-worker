@@ -179,9 +179,9 @@ class QueueJobRunner:
         # Stress tests intentionally run multiple supervisors against one
         # DB to exercise inter-process SKIP LOCKED contention and set
         # this to 0.
-        advisory_lock_env = os.environ.get(
-            "QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK", "1"
-        ).strip().lower()
+        advisory_lock_env = (
+            os.environ.get("QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK", "1").strip().lower()
+        )
         use_advisory_lock = advisory_lock_env not in ("0", "false", "no", "off")
         return cls(
             database_names=database_names,

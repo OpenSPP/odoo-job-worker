@@ -23,7 +23,6 @@ from .stress_common import (
     pg_version,
     record_report,
     runner_subprocess,
-    wait_for_started_count,
     wait_for_terminal_count,
 )
 
@@ -99,9 +98,7 @@ class TestS9NotifyLatencyUnderFlood(TransactionCase):
                 "WHERE channel = %s AND started_at IS NOT NULL",
                 (channel,),
             )
-            pickup_ms = [
-                float(row[0]) for row in cr.fetchall() if row[0] is not None
-            ]
+            pickup_ms = [float(row[0]) for row in cr.fetchall() if row[0] is not None]
 
         # Hard assertion: every job picked up. No job sat in pending
         # for more than 5s once enqueued.
@@ -115,7 +112,8 @@ class TestS9NotifyLatencyUnderFlood(TransactionCase):
 
         worst_pickup_ms = max(pickup_ms) if pickup_ms else 0
         self.assertLess(
-            worst_pickup_ms, 5000,
+            worst_pickup_ms,
+            5000,
             f"some job sat pending > 5s after enqueue: worst pickup "
             f"latency = {worst_pickup_ms:.1f}ms",
         )

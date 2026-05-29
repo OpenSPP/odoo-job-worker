@@ -17,8 +17,8 @@ from odoo.tests.common import TransactionCase, tagged
 from .stress_common import (
     assert_queue_invariants,
     clear_queue,
-    pg_version,
     percentile,
+    pg_version,
     record_report,
 )
 
@@ -87,7 +87,9 @@ class TestS1SustainedThroughput(TransactionCase):
             done = env["queue.job"].search_count(
                 [("channel", "=", channel), ("state", "=", "done")]
             )
-            self.assertEqual(done, TOTAL_JOBS, f"expected {TOTAL_JOBS} done, got {done}")
+            self.assertEqual(
+                done, TOTAL_JOBS, f"expected {TOTAL_JOBS} done, got {done}"
+            )
             assert_queue_invariants(self, env, expected_total=TOTAL_JOBS)
 
         # Soft assertions: report only. Baseline comparison happens
@@ -106,9 +108,9 @@ class TestS1SustainedThroughput(TransactionCase):
                     "drain": round(drain_elapsed, 3),
                     "total": round(enqueue_elapsed + drain_elapsed, 3),
                 },
-                "throughput_jobs_per_sec": round(
-                    TOTAL_JOBS / drain_elapsed, 2
-                ) if drain_elapsed > 0 else None,
+                "throughput_jobs_per_sec": round(TOTAL_JOBS / drain_elapsed, 2)
+                if drain_elapsed > 0
+                else None,
                 "chunk_size": CHUNK_SIZE,
                 "chunk_latency_ms": {
                     "p50": round(percentile(chunk_timings, 50), 2),

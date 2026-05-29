@@ -102,7 +102,8 @@ class TestS7TimeoutUnderLoad(TransactionCase):
             )
 
             self.assertEqual(
-                len(failed_jobs), TOTAL_JOBS,
+                len(failed_jobs),
+                TOTAL_JOBS,
                 f"expected {TOTAL_JOBS} failed, got {len(failed_jobs)}",
             )
             self.assertEqual(done, 0, "no jobs should reach 'done' on timeout")
@@ -112,7 +113,8 @@ class TestS7TimeoutUnderLoad(TransactionCase):
                 lambda j: j.exc_info and "TimeoutJobError" in j.exc_info
             )
             self.assertEqual(
-                len(timeout_failures), TOTAL_JOBS,
+                len(timeout_failures),
+                TOTAL_JOBS,
                 f"only {len(timeout_failures)}/{TOTAL_JOBS} jobs had "
                 f"TimeoutJobError in exc_info",
             )
@@ -136,8 +138,7 @@ class TestS7TimeoutUnderLoad(TransactionCase):
                 },
                 "duration_field_samples": len(durations),
                 "duration_avg_seconds": (
-                    round(sum(durations) / len(durations), 3)
-                    if durations else None
+                    round(sum(durations) / len(durations), 3) if durations else None
                 ),
                 "pg_version": pg_version(self.env.registry),
             },

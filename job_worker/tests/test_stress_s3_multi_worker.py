@@ -198,9 +198,9 @@ class TestS3MultiWorkerContention(TransactionCase):
                     "drain": round(drain_elapsed, 3),
                     "total": round(total_elapsed, 3),
                 },
-                "throughput_jobs_per_sec": round(
-                    TOTAL_JOBS / drain_elapsed, 2
-                ) if drain_elapsed > 0 else None,
+                "throughput_jobs_per_sec": round(TOTAL_JOBS / drain_elapsed, 2)
+                if drain_elapsed > 0
+                else None,
                 "pg_version": pg_version(self.env.registry),
             },
         )

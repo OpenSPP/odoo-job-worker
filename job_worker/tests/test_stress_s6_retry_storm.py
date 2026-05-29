@@ -117,7 +117,7 @@ class TestS6RetryStorm(TransactionCase):
             self.assertEqual(
                 attempts_sum,
                 TOTAL_JOBS,
-                f"expected sum(attempts) = {TOTAL_JOBS} (1 per job), got {attempts_sum}",
+                f"sum(attempts) expected={TOTAL_JOBS} (1/job), got={attempts_sum}",
             )
             wrong_attempt_jobs = done_jobs.filtered(lambda j: j.attempts != 1)
             self.assertFalse(
@@ -149,9 +149,9 @@ class TestS6RetryStorm(TransactionCase):
                 "elapsed_seconds": {"drain": round(drain_elapsed, 3)},
                 "drain_iterations": iterations,
                 "attempts_sum": attempts_sum,
-                "throughput_jobs_per_sec": round(
-                    TOTAL_JOBS / drain_elapsed, 2
-                ) if drain_elapsed > 0 else None,
+                "throughput_jobs_per_sec": round(TOTAL_JOBS / drain_elapsed, 2)
+                if drain_elapsed > 0
+                else None,
                 "pg_version": pg_version(self.env.registry),
             },
         )
