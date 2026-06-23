@@ -308,6 +308,98 @@ class TestWorkerExecution(TransactionCase):
             self.assertEqual(second.attempts, 2)
             self.assertIn("not found", second.exc_info or "")
 
+    def test_execute_job_missing_model_is_retried_not_permanently_failed(self):
+        """A model absent from the worker's registry is a transient lag, not
+        a failure: re-queue without consuming the attempt budget.
+
+        The worker is a separate process that builds its registry by importing
+        module code from its own addons-path. Right after a module is installed
+        or updated from the UI (before the worker's signaling reload lands), or
+        while the worker is mid-redeploy, a model can be present on the app
+        server yet absent here. A bare lookup would raise KeyError, be treated
+        as a normal failure, and burn the whole retry budget — permanently
+        failing a job that would succeed seconds later once the registry
+        reloads. Instead the worker re-queues with ``ignore_retry`` and
+        expedites the next signaling check.
+        """
+        with self._external_env() as (cr, env):
+            partner = env["res.partner"].create({"name": "Lagging Worker"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "x"}],
+                kwargs={},
+                max_retries=3,
+                channel="missing_model",
+            )
+            # Simulate a worker whose registry lags the app server: rewrite the
+            # stored payload to a model that is not in the registry. Only nested
+            # odoo_recordset objects are dereferenced on decode, so an empty
+            # args/ids payload with a bogus model string decodes cleanly.
+            # ``payload`` is a fields.Json column → read/write plain dicts.
+            payload = dict(job.payload)
+            payload["model"] = "this.model.is.not.loaded.yet"
+            payload["args"] = []
+            payload["ids"] = []
+            job.payload = payload
+            job.env.cr.flush()
+
+            worker = QueueWorker(cr.dbname)
+            worker._last_registry_check = 999999.0  # sentinel: must be reset to 0
+            worker.execute_job(cr, job.id)
+
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            # Re-queued, not failed; attempt budget untouched (ignore_retry).
+            self.assertEqual(refreshed.state, "pending")
+            self.assertEqual(refreshed.attempts, 0)
+            self.assertTrue(refreshed.scheduled_at)
+            self.assertIn("registry", (refreshed.exc_info or "").lower())
+            # The next registry signaling check was expedited.
+            self.assertEqual(worker._last_registry_check, 0.0)
+
+    def test_execute_job_missing_model_fails_normally_past_grace_window(self):
+        """Past the registry-lag grace window, a still-missing model stops being
+        treated as transient lag and fails through the normal retry budget —
+        so a genuinely-missing model (typo / uninstalled) does not re-queue
+        forever. Driven here by backdating the job past the grace window.
+        """
+        with self._external_env() as (cr, env):
+            partner = env["res.partner"].create({"name": "Never Deployed"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "x"}],
+                kwargs={},
+                max_retries=3,
+                channel="missing_model_grace",
+            )
+            payload = dict(job.payload)
+            payload["model"] = "this.model.is.not.loaded.yet"
+            payload["args"] = []
+            payload["ids"] = []
+            job.payload = payload
+            # Backdate the job well past the default grace window so it is no
+            # longer treated as a transiently-lagging worker.
+            old = fields.Datetime.now() - timedelta(hours=2)
+            env.cr.execute(
+                "UPDATE queue_job SET create_date = %s WHERE id = %s",
+                (old, job.id),
+            )
+            env.invalidate_all()
+
+            worker = QueueWorker(cr.dbname)  # default grace = 3600s
+            worker.execute_job(cr, job.id)
+
+            env.invalidate_all()
+            refreshed = env["queue.job"].browse(job.id)
+            # Normal failure path: the attempt IS counted (not ignore_retry).
+            self.assertEqual(refreshed.state, "pending")
+            self.assertEqual(refreshed.attempts, 1)
+            self.assertTrue(refreshed.exc_info)
+
     def test_button_requeue_resets_job_and_notifies(self):
         job = self.Job.enqueue(
             model_name="res.users",

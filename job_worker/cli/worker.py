@@ -120,6 +120,7 @@ class QueueWorker:
         max_backoff_seconds=3600,
         concurrency=2,
         registry_check_interval=30,
+        registry_lag_grace_seconds=3600,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -132,6 +133,13 @@ class QueueWorker:
         self.max_backoff_seconds = max(10, int(max_backoff_seconds))
         self.concurrency = max(1, int(concurrency))
         self.registry_check_interval = max(5, int(registry_check_interval))
+        # How long a job may keep getting re-queued purely because its model is
+        # missing from this worker's registry (worker lagging the app server).
+        # Generous by default so it comfortably covers a redeploy; past it the
+        # model is almost certainly never coming, so the job stops being treated
+        # as "transiently lagging" and fails through the normal retry path
+        # instead of re-queueing forever.
+        self.registry_lag_grace_seconds = max(0, int(registry_lag_grace_seconds))
         self.db = odoo.sql_db.db_connect(self.db_name)
         self._pool = ThreadPoolExecutor(
             max_workers=self.concurrency,
@@ -503,6 +511,55 @@ class QueueWorker:
             )
             cr.commit()
 
+    def _guard_model_in_registry(self, run_env, model_name, job):
+        """Cope with a job whose model is missing from this worker's registry.
+
+        A missing model almost always means the worker is transiently behind
+        the app server, NOT that the job is bad: the worker is a separate
+        process that builds its registry by importing module code from its own
+        addons-path, so right after a module is installed/updated from the UI
+        (before the 30s signaling reload lands) or while the worker is being
+        redeployed, the model can be absent here while present on the server.
+        A bare ``run_env[model_name]`` lookup would raise ``KeyError``, be
+        treated as a normal failure, and burn the whole retry budget — failing
+        a job that would succeed seconds later once the registry reloads.
+
+        For a generous grace window we instead expedite the next signaling
+        check and re-queue WITHOUT consuming an attempt, so the job rides out
+        the catch-up window. Past the grace window the model is almost
+        certainly never coming (a typo'd/uninstalled model, or a worker that
+        will never get the code), so we return and let the caller's normal
+        lookup raise and fail through the standard retry budget rather than
+        re-queueing forever.
+        """
+        if model_name in run_env.registry.models:
+            return
+        job_age = (
+            (fields.Datetime.now() - job.create_date).total_seconds()
+            if job.create_date
+            else 0.0
+        )
+        if job_age <= self.registry_lag_grace_seconds:
+            self._last_registry_check = 0.0  # force a reload on the next loop tick
+            raise RetryableJobError(
+                f"Model {model_name!r} is not in this worker's registry yet — "
+                f"the worker likely lags the app server (a module install/"
+                f"update or redeploy in progress). Reloading the registry and "
+                f"retrying.",
+                seconds=self.registry_check_interval,
+                ignore_retry=True,
+            )
+        _logger.error(
+            "Model %r still missing from this worker's registry after %.0fs "
+            "(grace %ss); the worker's code likely never received the module "
+            "(check its addons-path / redeploy). Failing job %s through the "
+            "normal retry path.",
+            model_name,
+            job_age,
+            self.registry_lag_grace_seconds,
+            job.id,
+        )
+
     def execute_job(self, cr, job_id):
         """
         Execute the job.
@@ -563,6 +620,8 @@ class QueueWorker:
             args = payload.get("args", [])
             kwargs = payload.get("kwargs", {})
             record_ids = payload.get("ids")
+
+            self._guard_model_in_registry(run_env, model_name, job)
             run_model = run_env[model_name].with_company(run_company_id)
 
             # Execute
