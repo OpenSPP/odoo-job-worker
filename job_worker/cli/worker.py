@@ -532,7 +532,7 @@ class QueueWorker:
         lookup raise and fail through the standard retry budget rather than
         re-queueing forever.
         """
-        if model_name in run_env.registry.models:
+        if model_name in run_env:
             return
         job_age = (
             (fields.Datetime.now() - job.create_date).total_seconds()
