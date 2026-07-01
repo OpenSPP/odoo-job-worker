@@ -21,6 +21,7 @@ _RUNNER_TEST_FILES = [
     "test_runner_discovery.py",
     "test_runner_lifecycle.py",
     "test_runner_thread_management.py",
+    "test_heartbeat.py",
 ]
 
 

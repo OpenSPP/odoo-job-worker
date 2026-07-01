@@ -10,6 +10,7 @@ import psycopg2
 
 import odoo
 
+from .heartbeat import heartbeat_file_path, write_heartbeat
 from .worker import QueueWorker
 
 _logger = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class QueueJobRunner:
         join_timeout_seconds=30,
         worker_stall_timeout_seconds=120,
         worker_keyword_arguments=None,
+        heartbeat_file=None,
     ):
         self.database_names = database_names
         self.discovery_interval_seconds = discovery_interval_seconds
@@ -161,6 +163,7 @@ class QueueJobRunner:
         # the container's restart policy bring it back. 0 disables the watchdog.
         self.worker_stall_timeout_seconds = worker_stall_timeout_seconds
         self.worker_keyword_arguments = worker_keyword_arguments or {}
+        self._heartbeat_file = heartbeat_file or heartbeat_file_path()
 
         self.stop_event = threading.Event()
         self._worker_threads = {}
@@ -228,6 +231,7 @@ class QueueJobRunner:
 
             self._check_thread_health()
             self._check_worker_progress()
+            self._update_heartbeat()
             self.stop_event.wait(timeout=10)
 
         self._cleanup()
@@ -398,6 +402,54 @@ class QueueJobRunner:
                 self.failure_window_seconds,
             )
             self._quarantined_databases.add(db_name)
+
+    def _update_heartbeat(self):
+        """Refresh the heartbeat file unless the worker fleet is degraded.
+
+        The heartbeat is written on every healthy supervisor iteration, so
+        the freshness of the file reflects that the loop is alive *and*
+        iterating.  When the fleet is degraded the heartbeat is left to go
+        stale so an external healthcheck reports the container unhealthy.
+
+        This is a best-effort side channel: any failure — an unwritable
+        path, or a transient error while inspecting fleet state that worker
+        threads mutate concurrently — is logged and swallowed.  It must
+        never take down the supervisor loop.
+        """
+        try:
+            if self._fleet_is_degraded():
+                return
+            write_heartbeat(self._heartbeat_file)
+        except Exception:
+            _logger.warning(
+                "Could not update heartbeat file %s",
+                self._heartbeat_file,
+                exc_info=True,
+            )
+
+    def _fleet_is_degraded(self):
+        """Return True if any database's worker is failing past the threshold.
+
+        A quarantined database is degraded by definition.  We also treat a
+        database whose recent failure count has reached the quarantine
+        threshold as degraded even when it is not currently quarantined:
+        ``discover_databases`` clears the quarantine set on every pass, but
+        ``_failure_timestamps`` survives, so checking the failure history
+        keeps the signal stable for a persistently broken database instead
+        of flapping healthy after each rediscovery.
+        """
+        if self._quarantined_databases:
+            return True
+        cutoff = time.monotonic() - self.failure_window_seconds
+        # Snapshot the values: a crashing worker thread may add a key to
+        # _failure_timestamps via _record_failure concurrently, and iterating
+        # the live dict would raise "dictionary changed size during iteration".
+        # This mirrors the list(...) guarding used in _check_thread_health.
+        for timestamps in list(self._failure_timestamps.values()):
+            recent = sum(1 for ts in timestamps if ts >= cutoff)
+            if recent >= self.maximum_consecutive_failures:
+                return True
+        return False
 
     def _cleanup(self):
         """Stop all workers and close all lock connections."""
