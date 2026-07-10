@@ -534,6 +534,19 @@ class QueueWorker:
         if run_user.tz:
             run_context["tz"] = run_user.tz
         run_env = api.Environment(cr, run_uid, run_context)
+        # Tag the executing pool thread with the database name (and uid), the
+        # same way Odoo's HTTP dispatcher and cron runner do. Odoo's QWeb
+        # report renderer reads ``threading.current_thread().dbname`` in
+        # ``ir.qweb`` (``QwebContent.irQweb``); on a pool thread that attribute
+        # is unset, so accessing it raises ``AttributeError`` inside the QWeb
+        # lazy-value property, which then recurses through ``__getattr__`` ->
+        # ``__html__`` -> ``__str__`` until the stack overflows. Any job that
+        # renders a QWeb report (e.g. a PDF disbursement voucher) crashes
+        # without this. Setting it makes report rendering inside jobs behave
+        # like a request/cron.
+        current_thread = threading.current_thread()
+        current_thread.dbname = cr.dbname
+        current_thread.uid = run_uid
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
