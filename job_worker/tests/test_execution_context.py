@@ -224,17 +224,26 @@ class TestExecutionContext(TransactionCase):
                 )
                 return original_search(self, *args, **kwargs)
 
-            # Simulate a fresh pool thread with no dbname, so the assertion
-            # proves execute_job sets it (rather than inheriting the test
-            # runner's).
+            # Simulate a fresh pool thread with no dbname/uid, so the assertions
+            # prove execute_job (a) sets dbname during execution and (b) leaves
+            # the reused thread clean afterwards.
             saved_dbname = getattr(thread, "dbname", None)
+            saved_uid = getattr(thread, "uid", None)
             try:
                 if hasattr(thread, "dbname"):
                     del thread.dbname
+                if hasattr(thread, "uid"):
+                    del thread.uid
                 with patch.object(users_cls, "search", _capturing_search):
                     worker.execute_job(cr, job.id)
+                # Set while the job runs...
+                self.assertEqual(captured.get("dbname"), cr.dbname)
+                # ...and restored (removed) afterwards, so a pooled thread does
+                # not leak this job's db/user context onto the next job.
+                self.assertFalse(hasattr(thread, "dbname"))
+                self.assertFalse(hasattr(thread, "uid"))
             finally:
                 if saved_dbname is not None:
                     thread.dbname = saved_dbname
-
-            self.assertEqual(captured.get("dbname"), cr.dbname)
+                if saved_uid is not None:
+                    thread.uid = saved_uid

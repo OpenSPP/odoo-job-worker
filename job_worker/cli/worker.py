@@ -544,7 +544,14 @@ class QueueWorker:
         # renders a QWeb report (e.g. a PDF disbursement voucher) crashes
         # without this. Setting it makes report rendering inside jobs behave
         # like a request/cron.
+        #
+        # Pool threads are reused across jobs, so the originals are captured
+        # here and restored in the ``finally`` below — leaving stale dbname/uid
+        # on an idle pooled thread could otherwise contaminate later work that
+        # reads them (e.g. registry/env/security code).
         current_thread = threading.current_thread()
+        orig_thread_dbname = getattr(current_thread, "dbname", None)
+        orig_thread_uid = getattr(current_thread, "uid", None)
         current_thread.dbname = cr.dbname
         current_thread.uid = run_uid
         heartbeat_stop = threading.Event()
@@ -698,6 +705,18 @@ class QueueWorker:
                 job2 = env2["queue.job"].browse(job_id)
                 self.handle_exception(job2, exc=exc)
         finally:
+            # Restore the thread's original dbname/uid — pool threads are
+            # reused, so we must not leak this job's context onto the next.
+            if orig_thread_dbname is None:
+                if hasattr(current_thread, "dbname"):
+                    del current_thread.dbname
+            else:
+                current_thread.dbname = orig_thread_dbname
+            if orig_thread_uid is None:
+                if hasattr(current_thread, "uid"):
+                    del current_thread.uid
+            else:
+                current_thread.uid = orig_thread_uid
             heartbeat_stop.set()
             with suppress(Exception):
                 heartbeat_thread.join(timeout=self.heartbeat_interval_seconds + 1)
