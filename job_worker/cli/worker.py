@@ -503,6 +503,20 @@ class QueueWorker:
             )
             cr.commit()
 
+    @staticmethod
+    def _restore_thread_identity(thread, dbname, uid):
+        """Restore (or clear) a pooled thread's ``dbname``/``uid`` after a job.
+
+        Threads are reused across jobs, so the job's database/user context must
+        not linger on the thread once it finishes.
+        """
+        for attr, value in (("dbname", dbname), ("uid", uid)):
+            if value is None:
+                if hasattr(thread, attr):
+                    delattr(thread, attr)
+            else:
+                setattr(thread, attr, value)
+
     def execute_job(self, cr, job_id):
         """
         Execute the job.
@@ -707,16 +721,9 @@ class QueueWorker:
         finally:
             # Restore the thread's original dbname/uid — pool threads are
             # reused, so we must not leak this job's context onto the next.
-            if orig_thread_dbname is None:
-                if hasattr(current_thread, "dbname"):
-                    del current_thread.dbname
-            else:
-                current_thread.dbname = orig_thread_dbname
-            if orig_thread_uid is None:
-                if hasattr(current_thread, "uid"):
-                    del current_thread.uid
-            else:
-                current_thread.uid = orig_thread_uid
+            self._restore_thread_identity(
+                current_thread, orig_thread_dbname, orig_thread_uid
+            )
             heartbeat_stop.set()
             with suppress(Exception):
                 heartbeat_thread.join(timeout=self.heartbeat_interval_seconds + 1)
