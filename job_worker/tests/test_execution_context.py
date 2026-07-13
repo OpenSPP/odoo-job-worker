@@ -1,3 +1,4 @@
+import threading
 import uuid
 from unittest.mock import patch
 
@@ -191,3 +192,58 @@ class TestExecutionContext(TransactionCase):
         )
 
         self.assertEqual(job.user_id.id, run_user.id)
+
+    def test_worker_sets_thread_dbname_during_execution(self):
+        """The executing thread must carry ``dbname`` (like Odoo's HTTP/cron
+        runners set it). Odoo's QWeb renderer reads
+        ``threading.current_thread().dbname`` in ``ir.qweb`` (``QwebContent.
+        irQweb``); on a pool thread without it, accessing the attribute raises
+        ``AttributeError`` inside the lazy-value property, which recurses
+        through ``__getattr__`` -> ``__html__`` -> ``__str__`` until the stack
+        overflows. Any job rendering a QWeb report (e.g. a PDF) crashes without
+        this. Capture the thread's ``dbname`` at the moment the job method runs.
+        """
+        with external_env(self.env, uid=SUPERUSER_ID) as (cr, env):
+            job = env["queue.job"].enqueue(
+                model_name="res.users",
+                method_name="search",
+                record_ids=[],
+                args=[[("id", "=", SUPERUSER_ID)]],
+                kwargs={},
+                channel="ctx_dbname",
+            )
+            worker = QueueWorker(cr.dbname)
+            thread = threading.current_thread()
+            users_cls = type(env["res.users"])
+            original_search = users_cls.search
+            captured = {}
+
+            def _capturing_search(self, *args, **kwargs):
+                captured["dbname"] = getattr(
+                    threading.current_thread(), "dbname", "UNSET"
+                )
+                return original_search(self, *args, **kwargs)
+
+            # Simulate a fresh pool thread with no dbname/uid, so the assertions
+            # prove execute_job (a) sets dbname during execution and (b) leaves
+            # the reused thread clean afterwards.
+            saved_dbname = getattr(thread, "dbname", None)
+            saved_uid = getattr(thread, "uid", None)
+            try:
+                if hasattr(thread, "dbname"):
+                    del thread.dbname
+                if hasattr(thread, "uid"):
+                    del thread.uid
+                with patch.object(users_cls, "search", _capturing_search):
+                    worker.execute_job(cr, job.id)
+                # Set while the job runs...
+                self.assertEqual(captured.get("dbname"), cr.dbname)
+                # ...and restored (removed) afterwards, so a pooled thread does
+                # not leak this job's db/user context onto the next job.
+                self.assertFalse(hasattr(thread, "dbname"))
+                self.assertFalse(hasattr(thread, "uid"))
+            finally:
+                if saved_dbname is not None:
+                    thread.dbname = saved_dbname
+                if saved_uid is not None:
+                    thread.uid = saved_uid

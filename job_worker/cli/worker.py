@@ -503,6 +503,20 @@ class QueueWorker:
             )
             cr.commit()
 
+    @staticmethod
+    def _restore_thread_identity(thread, dbname, uid):
+        """Restore (or clear) a pooled thread's ``dbname``/``uid`` after a job.
+
+        Threads are reused across jobs, so the job's database/user context must
+        not linger on the thread once it finishes.
+        """
+        for attr, value in (("dbname", dbname), ("uid", uid)):
+            if value is None:
+                if hasattr(thread, attr):
+                    delattr(thread, attr)
+            else:
+                setattr(thread, attr, value)
+
     def execute_job(self, cr, job_id):
         """
         Execute the job.
@@ -534,6 +548,26 @@ class QueueWorker:
         if run_user.tz:
             run_context["tz"] = run_user.tz
         run_env = api.Environment(cr, run_uid, run_context)
+        # Tag the executing pool thread with the database name (and uid), the
+        # same way Odoo's HTTP dispatcher and cron runner do. Odoo's QWeb
+        # report renderer reads ``threading.current_thread().dbname`` in
+        # ``ir.qweb`` (``QwebContent.irQweb``); on a pool thread that attribute
+        # is unset, so accessing it raises ``AttributeError`` inside the QWeb
+        # lazy-value property, which then recurses through ``__getattr__`` ->
+        # ``__html__`` -> ``__str__`` until the stack overflows. Any job that
+        # renders a QWeb report (e.g. a PDF disbursement voucher) crashes
+        # without this. Setting it makes report rendering inside jobs behave
+        # like a request/cron.
+        #
+        # Pool threads are reused across jobs, so the originals are captured
+        # here and restored in the ``finally`` below — leaving stale dbname/uid
+        # on an idle pooled thread could otherwise contaminate later work that
+        # reads them (e.g. registry/env/security code).
+        current_thread = threading.current_thread()
+        orig_thread_dbname = getattr(current_thread, "dbname", None)
+        orig_thread_uid = getattr(current_thread, "uid", None)
+        current_thread.dbname = cr.dbname
+        current_thread.uid = run_uid
         heartbeat_stop = threading.Event()
         heartbeat_thread = threading.Thread(
             target=self._heartbeat_loop,
@@ -685,6 +719,11 @@ class QueueWorker:
                 job2 = env2["queue.job"].browse(job_id)
                 self.handle_exception(job2, exc=exc)
         finally:
+            # Restore the thread's original dbname/uid — pool threads are
+            # reused, so we must not leak this job's context onto the next.
+            self._restore_thread_identity(
+                current_thread, orig_thread_dbname, orig_thread_uid
+            )
             heartbeat_stop.set()
             with suppress(Exception):
                 heartbeat_thread.join(timeout=self.heartbeat_interval_seconds + 1)
