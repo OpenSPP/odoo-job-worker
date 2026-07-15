@@ -307,7 +307,23 @@ class QueueWorker:
             with self._active_lock:
                 if len(self.active_job_ids) >= self.concurrency:
                     break
-            job_id = self._acquire_job()
+            try:
+                job_id = self._acquire_job()
+            except OperationalError as err:
+                # A transient DB spike (a concurrency failure surviving the
+                # retry wrapper, or the control-plane statement/lock timeout)
+                # must not crash the thread: that forces a supervisor restart +
+                # Odoo registry reload, which under the very load that caused
+                # the timeout snowballs into a registry-reload storm. Back off
+                # and retry on the next loop instead; non-transient errors
+                # still propagate so the runner restarts the worker.
+                if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                    raise
+                _logger.warning(
+                    "Transient DB error during job acquisition (%s); backing off",
+                    err.pgcode,
+                )
+                job_id = None
             if not job_id:
                 # No jobs acquirable right now. If jobs are still
                 # running, wait for a slot to free up — the completing
@@ -322,38 +338,34 @@ class QueueWorker:
                 self.active_job_ids.add(job_id)
             self._pool.submit(self._execute_and_cleanup, job_id)
 
+    @retry_on_serialization_failure(max_retries=3, base_delay=0.05)
     def _acquire_job(self):
         """Acquire one job using SKIP LOCKED and commit the 'started' state.
 
-        Returns the job ID, or None if no job is available OR a transient DB
-        error (concurrency / statement-timeout) occurred — the caller simply
-        retries next loop. Non-transient errors (e.g. connection failures)
-        still propagate so the runner restarts the worker.
+        Returns the job ID or None if no job is available. A transient DB
+        error (a concurrency failure that survives the retry wrapper, or a
+        statement/lock timeout) propagates and is backed off by the caller
+        (``process_jobs``) rather than crashing the worker thread.
+
+        Uses READ COMMITTED isolation and a serialization-failure retry
+        wrapper: the acquire query has a WITH clause whose aggregation
+        subqueries (fresh_running_counts, recent_starts_counts) read many
+        rows, and under REPEATABLE READ contention these snapshots can race
+        with concurrent commits and surface as ``SerializationFailure`` —
+        even though the FOR UPDATE SKIP LOCKED clause itself is conflict-free.
+        Control-plane statement/lock timeouts are applied so a blocked
+        acquire cannot hang the loop indefinitely.
         """
-        try:
-            with self.db.cursor() as cr:
-                _apply_control_plane_timeouts(
-                    cr,
-                    self.control_statement_timeout_ms,
-                    self.control_lock_timeout_ms,
-                )
-                job_id = self.acquire_job_lock(cr)
-                if not job_id:
-                    return None
-                cr.commit()
-                return job_id
-        except OperationalError as err:
-            # A transient DB spike (concurrency error, or the new statement/lock
-            # timeout) must not crash the thread: that triggers a supervisor
-            # restart + registry reload, which compounds the load into a storm.
-            # Back off and let the next loop iteration retry instead.
-            if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
-                raise
-            _logger.warning(
-                "Transient DB error during job acquisition (%s); backing off",
-                err.pgcode,
-            )
-            return None
+        with read_committed_cursor(
+            self.db,
+            statement_timeout_ms=self.control_statement_timeout_ms,
+            lock_timeout_ms=self.control_lock_timeout_ms,
+        ) as cr:
+            job_id = self.acquire_job_lock(cr)
+            if not job_id:
+                return None
+            cr.commit()
+            return job_id
 
     def _execute_and_cleanup(self, job_id):
         """Pool thread entry point. Executes a single job and cleans up.

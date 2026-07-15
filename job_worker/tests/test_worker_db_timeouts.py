@@ -94,25 +94,27 @@ class TestWorkerDbTimeouts(TransactionCase):
         self.assertEqual(worker.control_statement_timeout_ms, 0)
         self.assertEqual(worker.control_lock_timeout_ms, 0)
 
-    def test_acquire_job_backs_off_on_transient_error(self):
-        """A transient DB timeout/concurrency error during acquisition must
-        return None (back off), not crash the thread — else the supervisor
-        restart + registry reload snowballs under load."""
+    def test_process_jobs_backs_off_on_transient_acquire_error(self):
+        """A transient acquire error (here a statement_timeout, which the
+        serialization-retry wrapper does not retry) must be backed off by the
+        process_jobs loop, not crash the thread — else the supervisor restart +
+        registry reload snowballs under load."""
 
         class _StatementTimeout(OperationalError):
             pgcode = "57014"  # query_canceled (statement_timeout)
 
         worker = QueueWorker(self.env.cr.dbname)
-        with patch.object(worker, "acquire_job_lock", side_effect=_StatementTimeout()):
-            self.assertIsNone(worker._acquire_job())
+        with patch.object(worker, "_acquire_job", side_effect=_StatementTimeout()):
+            # No active jobs -> one iteration, then a clean break. Must not raise.
+            worker.process_jobs()
 
-    def test_acquire_job_reraises_non_transient_error(self):
+    def test_process_jobs_reraises_non_transient_acquire_error(self):
         """A non-transient DB error still propagates so the runner can react."""
 
         class _OtherError(OperationalError):
             pgcode = "23505"  # unique_violation — not transient
 
         worker = QueueWorker(self.env.cr.dbname)
-        with patch.object(worker, "acquire_job_lock", side_effect=_OtherError()):
+        with patch.object(worker, "_acquire_job", side_effect=_OtherError()):
             with self.assertRaises(OperationalError):
-                worker._acquire_job()
+                worker.process_jobs()
