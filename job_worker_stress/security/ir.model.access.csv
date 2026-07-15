@@ -1,0 +1,2 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_job_worker_stress_counter,job.worker.stress.counter,model_job_worker_stress_counter,base.group_user,1,1,1,1
