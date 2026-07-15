@@ -1,6 +1,7 @@
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from contextlib import closing
@@ -364,6 +365,12 @@ class QueueJobRunner:
             age,
             self.worker_stall_timeout_seconds,
         )
+        # os._exit bypasses normal interpreter shutdown, so buffered log
+        # records and stdio would be lost — flush them first, or the
+        # diagnostic above never reaches the logs.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        logging.shutdown()
         os._exit(1)
 
     def _record_failure(self, db_name):

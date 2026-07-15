@@ -271,6 +271,12 @@ class TestWorkerProgressWatchdog(unittest.TestCase):
 
     def test_terminate_exits_process(self):
         runner = self._make_runner()
-        with patch.object(_runner.os, "_exit") as mock_exit:
+        # Patch logging.shutdown too — the real one would tear down logging for
+        # the whole test process (os._exit is patched, so it does not exit).
+        with (
+            patch.object(_runner.os, "_exit") as mock_exit,
+            patch.object(_runner.logging, "shutdown") as mock_shutdown,
+        ):
             runner._terminate_stalled_worker("db1", 999)
         mock_exit.assert_called_once_with(1)
+        mock_shutdown.assert_called_once()

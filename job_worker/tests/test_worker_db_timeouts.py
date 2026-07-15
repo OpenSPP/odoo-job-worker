@@ -1,4 +1,5 @@
 from contextlib import closing
+from unittest.mock import patch
 
 from psycopg2 import OperationalError
 
@@ -28,7 +29,9 @@ class TestWorkerDbTimeouts(TransactionCase):
 
     def test_read_committed_cursor_applies_timeouts(self):
         db = self._db()
-        with read_committed_cursor(db, statement_timeout_ms=250, lock_timeout_ms=750) as cr:
+        with read_committed_cursor(
+            db, statement_timeout_ms=250, lock_timeout_ms=750
+        ) as cr:
             cr.execute("SHOW statement_timeout")
             self.assertEqual(cr.fetchone()[0], "250ms")
             cr.execute("SHOW lock_timeout")
@@ -90,3 +93,26 @@ class TestWorkerDbTimeouts(TransactionCase):
         )
         self.assertEqual(worker.control_statement_timeout_ms, 0)
         self.assertEqual(worker.control_lock_timeout_ms, 0)
+
+    def test_acquire_job_backs_off_on_transient_error(self):
+        """A transient DB timeout/concurrency error during acquisition must
+        return None (back off), not crash the thread — else the supervisor
+        restart + registry reload snowballs under load."""
+
+        class _StatementTimeout(OperationalError):
+            pgcode = "57014"  # query_canceled (statement_timeout)
+
+        worker = QueueWorker(self.env.cr.dbname)
+        with patch.object(worker, "acquire_job_lock", side_effect=_StatementTimeout()):
+            self.assertIsNone(worker._acquire_job())
+
+    def test_acquire_job_reraises_non_transient_error(self):
+        """A non-transient DB error still propagates so the runner can react."""
+
+        class _OtherError(OperationalError):
+            pgcode = "23505"  # unique_violation — not transient
+
+        worker = QueueWorker(self.env.cr.dbname)
+        with patch.object(worker, "acquire_job_lock", side_effect=_OtherError()):
+            with self.assertRaises(OperationalError):
+                worker._acquire_job()

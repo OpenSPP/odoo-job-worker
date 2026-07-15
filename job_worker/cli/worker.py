@@ -28,6 +28,17 @@ PG_CONCURRENCY_ERRORS_TO_RETRY = (
     "55P03",  # lock_not_available
 )
 
+# Transient errors where a control-plane op (heartbeat / acquire) should back
+# off and retry on the next loop, NOT crash the worker thread. Crashing forces
+# the supervisor to restart the thread and reload the Odoo registry — heavy DB
+# work that, under the very load that caused the timeout, snowballs into a
+# registry-reload storm. This is the concurrency set plus statement_timeout
+# cancellation (57014), both now reachable because control-plane cursors carry
+# SET LOCAL timeouts.
+PG_TRANSIENT_CONTROL_PLANE_ERRORS = PG_CONCURRENCY_ERRORS_TO_RETRY + (
+    "57014",  # query_canceled (statement_timeout)
+)
+
 
 def _apply_control_plane_timeouts(cr, statement_timeout_ms, lock_timeout_ms):
     """Bound a control-plane query so it can never block forever.
@@ -164,7 +175,9 @@ class QueueWorker:
         # heartbeat/acquire cursors only — NOT the job-execution path. A
         # blocked main-loop query then raises instead of hanging the worker
         # forever. 0 disables (leaves the server default).
-        self.control_statement_timeout_ms = max(0, int(statement_timeout_seconds * 1000))
+        self.control_statement_timeout_ms = max(
+            0, int(statement_timeout_seconds * 1000)
+        )
         self.control_lock_timeout_ms = max(0, int(lock_timeout_seconds * 1000))
         # Monotonic timestamp of the last main-loop iteration. The supervisor
         # reads this as a liveness signal: a hung loop stops advancing it even
@@ -221,8 +234,19 @@ class QueueWorker:
                     # 1. Process jobs until queue is empty or limit reached
                     self.process_jobs()
 
-                    # 2. Update heartbeats for currently running jobs (if any)
-                    self.update_heartbeats()
+                    # 2. Update heartbeats for currently running jobs (if any).
+                    # A transient DB timeout here must not crash the loop (see
+                    # _acquire_job) — skip this cycle and retry next iteration.
+                    try:
+                        self.update_heartbeats()
+                    except OperationalError as err:
+                        if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                            raise
+                        _logger.warning(
+                            "Transient DB error during heartbeat update (%s); "
+                            "skipping this cycle",
+                            err.pgcode,
+                        )
 
                     # 3. Wait for notification or timeout
                     conn = cr._cnx
@@ -301,21 +325,35 @@ class QueueWorker:
     def _acquire_job(self):
         """Acquire one job using SKIP LOCKED and commit the 'started' state.
 
-        Returns the job ID or None if no job is available.
-        Exceptions propagate up (appropriate for connection failures —
-        runner will restart the worker).
+        Returns the job ID, or None if no job is available OR a transient DB
+        error (concurrency / statement-timeout) occurred — the caller simply
+        retries next loop. Non-transient errors (e.g. connection failures)
+        still propagate so the runner restarts the worker.
         """
-        with self.db.cursor() as cr:
-            _apply_control_plane_timeouts(
-                cr,
-                self.control_statement_timeout_ms,
-                self.control_lock_timeout_ms,
+        try:
+            with self.db.cursor() as cr:
+                _apply_control_plane_timeouts(
+                    cr,
+                    self.control_statement_timeout_ms,
+                    self.control_lock_timeout_ms,
+                )
+                job_id = self.acquire_job_lock(cr)
+                if not job_id:
+                    return None
+                cr.commit()
+                return job_id
+        except OperationalError as err:
+            # A transient DB spike (concurrency error, or the new statement/lock
+            # timeout) must not crash the thread: that triggers a supervisor
+            # restart + registry reload, which compounds the load into a storm.
+            # Back off and let the next loop iteration retry instead.
+            if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                raise
+            _logger.warning(
+                "Transient DB error during job acquisition (%s); backing off",
+                err.pgcode,
             )
-            job_id = self.acquire_job_lock(cr)
-            if not job_id:
-                return None
-            cr.commit()
-            return job_id
+            return None
 
     def _execute_and_cleanup(self, job_id):
         """Pool thread entry point. Executes a single job and cleans up.
