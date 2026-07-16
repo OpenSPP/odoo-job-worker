@@ -1,6 +1,7 @@
 import logging
 import os
 import signal
+import sys
 import threading
 import time
 from contextlib import closing
@@ -145,6 +146,7 @@ class QueueJobRunner:
         maximum_consecutive_failures=5,
         failure_window_seconds=300,
         join_timeout_seconds=30,
+        worker_stall_timeout_seconds=120,
         worker_keyword_arguments=None,
     ):
         self.database_names = database_names
@@ -153,10 +155,16 @@ class QueueJobRunner:
         self.maximum_consecutive_failures = maximum_consecutive_failures
         self.failure_window_seconds = failure_window_seconds
         self.join_timeout_seconds = join_timeout_seconds
+        # A worker whose main loop has not advanced `last_progress` within this
+        # many seconds is treated as hung. A blocked Python thread cannot be
+        # killed, so the only reliable recovery is to exit the process and let
+        # the container's restart policy bring it back. 0 disables the watchdog.
+        self.worker_stall_timeout_seconds = worker_stall_timeout_seconds
         self.worker_keyword_arguments = worker_keyword_arguments or {}
 
         self.stop_event = threading.Event()
         self._worker_threads = {}
+        self._worker_instances = {}
         self._per_database_stop_events = {}
         self._advisory_lock_connections = {}
         self._failure_timestamps = {}
@@ -175,6 +183,20 @@ class QueueJobRunner:
                     name.strip() for name in db_names_raw.split(",") if name.strip()
                 ]
         concurrency = int(os.environ.get("QUEUE_JOB_CONCURRENCY", "2"))
+        worker_kwargs = {"concurrency": concurrency}
+        if "QUEUE_JOB_STATEMENT_TIMEOUT" in os.environ:
+            worker_kwargs["statement_timeout_seconds"] = int(
+                os.environ["QUEUE_JOB_STATEMENT_TIMEOUT"]
+            )
+        if "QUEUE_JOB_LOCK_TIMEOUT" in os.environ:
+            worker_kwargs["lock_timeout_seconds"] = int(
+                os.environ["QUEUE_JOB_LOCK_TIMEOUT"]
+            )
+        runner_kwargs = {}
+        if "QUEUE_JOB_WORKER_STALL_TIMEOUT" in os.environ:
+            runner_kwargs["worker_stall_timeout_seconds"] = int(
+                os.environ["QUEUE_JOB_WORKER_STALL_TIMEOUT"]
+            )
         # Advisory lock is on by default (serialises supervisors per DB).
         # Stress tests intentionally run multiple supervisors against one
         # DB to exercise inter-process SKIP LOCKED contention and set
@@ -186,7 +208,8 @@ class QueueJobRunner:
         return cls(
             database_names=database_names,
             use_advisory_lock=use_advisory_lock,
-            worker_keyword_arguments={"concurrency": concurrency},
+            worker_keyword_arguments=worker_kwargs,
+            **runner_kwargs,
         )
 
     def run(self):
@@ -204,6 +227,7 @@ class QueueJobRunner:
                 last_discovery = time.monotonic()
 
             self._check_thread_health()
+            self._check_worker_progress()
             self.stop_event.wait(timeout=10)
 
         self._cleanup()
@@ -276,6 +300,7 @@ class QueueJobRunner:
                     db_name,
                     self.join_timeout_seconds,
                 )
+        self._worker_instances.pop(db_name, None)
         lock_conn = self._advisory_lock_connections.pop(db_name, None)
         if lock_conn:
             try:
@@ -305,8 +330,57 @@ class QueueJobRunner:
                 continue
             # Remove old thread entry and start fresh
             self._worker_threads.pop(db_name, None)
+            self._worker_instances.pop(db_name, None)
             self._per_database_stop_events.pop(db_name, None)
             self._start_worker_thread(db_name)
+
+    def _check_worker_progress(self):
+        """Recycle a worker whose main loop has stalled (hung but alive).
+
+        ``_check_thread_health`` only restarts *dead* threads. A worker
+        blocked in a DB call or a wedged loop stays ``is_alive()`` yet stops
+        advancing its ``last_progress`` timestamp — a "zombie worker" that
+        drains nothing while the process (and ``restart: always``) sees
+        nothing wrong. This is the preprod 2026-07-13 failure mode.
+
+        A blocked Python thread cannot be force-killed, so the only reliable
+        recovery is to exit the process and let the container restart policy
+        bring every worker back fresh.
+        """
+        if self.worker_stall_timeout_seconds <= 0:
+            return
+        now = time.monotonic()
+        for db_name in list(self._worker_instances):
+            if self.stop_event.is_set():
+                return
+            worker = self._worker_instances.get(db_name)
+            thread = self._worker_threads.get(db_name)
+            if worker is None or thread is None or not thread.is_alive():
+                continue
+            age = now - worker.last_progress
+            if age > self.worker_stall_timeout_seconds:
+                self._terminate_stalled_worker(db_name, age)
+
+    def _terminate_stalled_worker(self, db_name, age):
+        """Exit the process so a hung worker is recovered by the restart policy.
+
+        Isolated in its own method so tests can assert the escalation without
+        actually killing the test process.
+        """
+        _logger.error(
+            "Worker for %s has not made progress in %.0fs (limit %ss); "
+            "exiting process for restart-policy recovery",
+            db_name,
+            age,
+            self.worker_stall_timeout_seconds,
+        )
+        # os._exit bypasses normal interpreter shutdown, so buffered log
+        # records and stdio would be lost — flush them first, or the
+        # diagnostic above never reaches the logs.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        logging.shutdown()
+        os._exit(1)
 
     def _record_failure(self, db_name):
         """Track a failure timestamp and quarantine if threshold exceeded."""
@@ -350,11 +424,16 @@ class QueueJobRunner:
                 stop_event=composite_stop_event,
                 **self.worker_keyword_arguments,
             )
+            # Publish the instance so the supervisor's progress watchdog can
+            # read its ``last_progress`` liveness timestamp.
+            self._worker_instances[db_name] = worker
             worker.run()
             _logger.info("Worker stopped for database %s", db_name)
         except Exception:
             _logger.exception("Worker crashed for database %s", db_name)
             self._record_failure(db_name)
+        finally:
+            self._worker_instances.pop(db_name, None)
 
     def _setup_signal_handlers(self):
         """Install signal handlers for graceful shutdown."""

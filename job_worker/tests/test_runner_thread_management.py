@@ -204,3 +204,79 @@ class TestDiscoveryAndRemoval(unittest.TestCase):
             runner.discover_databases()
         self.assertNotIn("bad_db", runner._worker_threads)
         self.assertIn("good_db", runner._worker_threads)
+
+
+class TestWorkerProgressWatchdog(unittest.TestCase):
+    """The supervisor must recycle a hung-but-alive worker.
+
+    _check_thread_health only restarts *dead* threads. A worker blocked in a
+    DB call keeps is_alive()==True but stops advancing last_progress — the
+    zombie-worker failure mode. _check_worker_progress must catch that and
+    escalate to a process exit (the only reliable recovery for a hung
+    thread), which _terminate_stalled_worker isolates for testability.
+    """
+
+    def _make_runner(self, **kwargs):
+        defaults = dict(
+            database_names=[],
+            use_advisory_lock=False,
+            worker_stall_timeout_seconds=120,
+        )
+        defaults.update(kwargs)
+        return QueueJobRunner(**defaults)
+
+    def _alive_thread(self):
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+        return thread
+
+    def _register(self, runner, db_name, last_progress, thread):
+        worker = MagicMock()
+        worker.last_progress = last_progress
+        runner._worker_instances[db_name] = worker
+        runner._worker_threads[db_name] = thread
+
+    def test_stalled_worker_is_terminated(self):
+        runner = self._make_runner()
+        self._register(runner, "db1", time.monotonic() - 999, self._alive_thread())
+        with patch.object(runner, "_terminate_stalled_worker") as term:
+            runner._check_worker_progress()
+        term.assert_called_once()
+        self.assertEqual(term.call_args[0][0], "db1")
+
+    def test_progressing_worker_is_left_alone(self):
+        runner = self._make_runner()
+        self._register(runner, "db1", time.monotonic(), self._alive_thread())
+        with patch.object(runner, "_terminate_stalled_worker") as term:
+            runner._check_worker_progress()
+        term.assert_not_called()
+
+    def test_dead_thread_is_not_the_watchdogs_job(self):
+        # A dead thread is _check_thread_health's responsibility; the progress
+        # watchdog only fires for threads that are alive but not progressing.
+        runner = self._make_runner()
+        dead = MagicMock()
+        dead.is_alive.return_value = False
+        self._register(runner, "db1", time.monotonic() - 999, dead)
+        with patch.object(runner, "_terminate_stalled_worker") as term:
+            runner._check_worker_progress()
+        term.assert_not_called()
+
+    def test_watchdog_disabled_when_timeout_zero(self):
+        runner = self._make_runner(worker_stall_timeout_seconds=0)
+        self._register(runner, "db1", time.monotonic() - 999, self._alive_thread())
+        with patch.object(runner, "_terminate_stalled_worker") as term:
+            runner._check_worker_progress()
+        term.assert_not_called()
+
+    def test_terminate_exits_process(self):
+        runner = self._make_runner()
+        # Patch logging.shutdown too — the real one would tear down logging for
+        # the whole test process (os._exit is patched, so it does not exit).
+        with (
+            patch.object(_runner.os, "_exit") as mock_exit,
+            patch.object(_runner.logging, "shutdown") as mock_shutdown,
+        ):
+            runner._terminate_stalled_worker("db1", 999)
+        mock_exit.assert_called_once_with(1)
+        mock_shutdown.assert_called_once()

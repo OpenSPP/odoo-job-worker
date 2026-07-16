@@ -28,9 +28,40 @@ PG_CONCURRENCY_ERRORS_TO_RETRY = (
     "55P03",  # lock_not_available
 )
 
+# Transient errors where a control-plane op (heartbeat / acquire) should back
+# off and retry on the next loop, NOT crash the worker thread. Crashing forces
+# the supervisor to restart the thread and reload the Odoo registry — heavy DB
+# work that, under the very load that caused the timeout, snowballs into a
+# registry-reload storm. This is the concurrency set plus statement_timeout
+# cancellation (57014), both now reachable because control-plane cursors carry
+# SET LOCAL timeouts.
+PG_TRANSIENT_CONTROL_PLANE_ERRORS = PG_CONCURRENCY_ERRORS_TO_RETRY + (
+    "57014",  # query_canceled (statement_timeout)
+)
+
+
+def _apply_control_plane_timeouts(cr, statement_timeout_ms, lock_timeout_ms):
+    """Bound a control-plane query so it can never block forever.
+
+    ``SET LOCAL`` scopes the timeouts to the current transaction, so they
+    never leak to the next borrower of this pooled connection — job
+    execution cursors must stay untouched or a long-running job would be
+    cancelled. A blocked heartbeat/acquire now raises (``query_canceled``
+    / ``lock_not_available``) instead of hanging the worker loop
+    indefinitely, which was the preprod zombie-worker root cause: with no
+    timeout, a blocked main-loop query froze the heartbeat while the
+    process stayed alive, so ``restart: always`` never fired.
+
+    Values ``<= 0`` are skipped (leaves the server/session default).
+    """
+    if statement_timeout_ms and statement_timeout_ms > 0:
+        cr.execute("SET LOCAL statement_timeout = %s", (int(statement_timeout_ms),))
+    if lock_timeout_ms and lock_timeout_ms > 0:
+        cr.execute("SET LOCAL lock_timeout = %s", (int(lock_timeout_ms),))
+
 
 @contextmanager
-def read_committed_cursor(db):
+def read_committed_cursor(db, statement_timeout_ms=0, lock_timeout_ms=0):
     """Context manager for READ COMMITTED isolation.
 
     PostgreSQL 18 has stricter serialization checks. For heartbeat
@@ -41,9 +72,15 @@ def read_committed_cursor(db):
     from the pool, and Odoo's cursor.__exit__ handles cleanup.
     Uses Odoo's internal cr._cnx (psycopg2 connection), which is
     stable in Odoo 19 but is a private API.
+
+    When ``statement_timeout_ms`` / ``lock_timeout_ms`` are given, the
+    query is bounded via ``SET LOCAL`` (see
+    ``_apply_control_plane_timeouts``); pass them for control-plane
+    (heartbeat) operations, leave them 0 for the job-execution path.
     """
     with db.cursor() as cr:
         cr._cnx.set_isolation_level(ISOLATION_LEVEL_READ_COMMITTED)
+        _apply_control_plane_timeouts(cr, statement_timeout_ms, lock_timeout_ms)
         yield cr
 
 
@@ -120,6 +157,8 @@ class QueueWorker:
         max_backoff_seconds=3600,
         concurrency=2,
         registry_check_interval=30,
+        statement_timeout_seconds=30,
+        lock_timeout_seconds=10,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -132,6 +171,18 @@ class QueueWorker:
         self.max_backoff_seconds = max(10, int(max_backoff_seconds))
         self.concurrency = max(1, int(concurrency))
         self.registry_check_interval = max(5, int(registry_check_interval))
+        # Control-plane query timeouts (ms), applied via SET LOCAL to the
+        # heartbeat/acquire cursors only — NOT the job-execution path. A
+        # blocked main-loop query then raises instead of hanging the worker
+        # forever. 0 disables (leaves the server default).
+        self.control_statement_timeout_ms = max(
+            0, int(statement_timeout_seconds * 1000)
+        )
+        self.control_lock_timeout_ms = max(0, int(lock_timeout_seconds * 1000))
+        # Monotonic timestamp of the last main-loop iteration. The supervisor
+        # reads this as a liveness signal: a hung loop stops advancing it even
+        # though the thread stays alive (see QueueJobRunner._check_worker_progress).
+        self.last_progress = time.monotonic()
         self.db = odoo.sql_db.db_connect(self.db_name)
         self._pool = ThreadPoolExecutor(
             max_workers=self.concurrency,
@@ -173,14 +224,29 @@ class QueueWorker:
                 _logger.info("Listening for jobs (concurrency=%d)...", self.concurrency)
 
                 while not self.stop_event.is_set():
+                    # Liveness signal for the supervisor watchdog: a hung
+                    # loop stops advancing this even though the thread lives.
+                    self.last_progress = time.monotonic()
+
                     # 0. Check for registry changes (module install/update)
                     self._check_registry()
 
                     # 1. Process jobs until queue is empty or limit reached
                     self.process_jobs()
 
-                    # 2. Update heartbeats for currently running jobs (if any)
-                    self.update_heartbeats()
+                    # 2. Update heartbeats for currently running jobs (if any).
+                    # A transient DB timeout here must not crash the loop (see
+                    # _acquire_job) — skip this cycle and retry next iteration.
+                    try:
+                        self.update_heartbeats()
+                    except OperationalError as err:
+                        if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                            raise
+                        _logger.warning(
+                            "Transient DB error during heartbeat update (%s); "
+                            "skipping this cycle",
+                            err.pgcode,
+                        )
 
                     # 3. Wait for notification or timeout
                     conn = cr._cnx
@@ -211,7 +277,11 @@ class QueueWorker:
             return
 
         _logger.debug("Updating heartbeats for jobs: %s", snapshot)
-        with read_committed_cursor(self.db) as cr:
+        with read_committed_cursor(
+            self.db,
+            statement_timeout_ms=self.control_statement_timeout_ms,
+            lock_timeout_ms=self.control_lock_timeout_ms,
+        ) as cr:
             cr.execute(
                 "UPDATE queue_job SET heartbeat = NOW()"
                 " WHERE id = ANY(%s) AND worker_id = %s",
@@ -237,7 +307,23 @@ class QueueWorker:
             with self._active_lock:
                 if len(self.active_job_ids) >= self.concurrency:
                     break
-            job_id = self._acquire_job()
+            try:
+                job_id = self._acquire_job()
+            except OperationalError as err:
+                # A transient DB spike (a concurrency failure surviving the
+                # retry wrapper, or the control-plane statement/lock timeout)
+                # must not crash the thread: that forces a supervisor restart +
+                # Odoo registry reload, which under the very load that caused
+                # the timeout snowballs into a registry-reload storm. Back off
+                # and retry on the next loop instead; non-transient errors
+                # still propagate so the runner restarts the worker.
+                if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                    raise
+                _logger.warning(
+                    "Transient DB error during job acquisition (%s); backing off",
+                    err.pgcode,
+                )
+                job_id = None
             if not job_id:
                 # No jobs acquirable right now. If jobs are still
                 # running, wait for a slot to free up — the completing
@@ -256,19 +342,25 @@ class QueueWorker:
     def _acquire_job(self):
         """Acquire one job using SKIP LOCKED and commit the 'started' state.
 
-        Returns the job ID or None if no job is available.
-        Exceptions propagate up (appropriate for connection failures —
-        runner will restart the worker).
+        Returns the job ID or None if no job is available. A transient DB
+        error (a concurrency failure that survives the retry wrapper, or a
+        statement/lock timeout) propagates and is backed off by the caller
+        (``process_jobs``) rather than crashing the worker thread.
 
         Uses READ COMMITTED isolation and a serialization-failure retry
-        wrapper. The acquire query has a WITH clause whose aggregation
-        subqueries (fresh_running_counts, recent_starts_counts) read
-        many rows, and under REPEATABLE READ contention these snapshots
-        can race with concurrent commits and surface as
-        ``SerializationFailure`` — even though the FOR UPDATE SKIP LOCKED
-        clause itself is conflict-free.
+        wrapper: the acquire query has a WITH clause whose aggregation
+        subqueries (fresh_running_counts, recent_starts_counts) read many
+        rows, and under REPEATABLE READ contention these snapshots can race
+        with concurrent commits and surface as ``SerializationFailure`` —
+        even though the FOR UPDATE SKIP LOCKED clause itself is conflict-free.
+        Control-plane statement/lock timeouts are applied so a blocked
+        acquire cannot hang the loop indefinitely.
         """
-        with read_committed_cursor(self.db) as cr:
+        with read_committed_cursor(
+            self.db,
+            statement_timeout_ms=self.control_statement_timeout_ms,
+            lock_timeout_ms=self.control_lock_timeout_ms,
+        ) as cr:
             job_id = self.acquire_job_lock(cr)
             if not job_id:
                 return None
@@ -367,7 +459,11 @@ class QueueWorker:
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def _heartbeat_job(self, job_id):
         """Update heartbeat for single job. Uses READ COMMITTED isolation."""
-        with read_committed_cursor(self.db) as hb_cr:
+        with read_committed_cursor(
+            self.db,
+            statement_timeout_ms=self.control_statement_timeout_ms,
+            lock_timeout_ms=self.control_lock_timeout_ms,
+        ) as hb_cr:
             hb_cr.execute(
                 """
                 UPDATE queue_job
