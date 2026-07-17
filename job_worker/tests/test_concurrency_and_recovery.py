@@ -12,6 +12,7 @@ from odoo import SUPERUSER_ID, api, fields
 from odoo.tests.common import TransactionCase, tagged
 
 from ..cli.worker import QueueWorker, _retry_db_operation, read_committed_cursor
+from ..exception import TransientRegistryError
 
 
 @tagged("post_install", "-at_install")
@@ -197,6 +198,52 @@ class TestConcurrencyAndRecovery(TransactionCase):
             self.assertEqual(
                 self._read_state_attempts(job_id), ("started", expected_attempt)
             )
+
+    def test_transient_registry_error_retries_young_job_without_attempt(self):
+        """A missing-model error on a young job retries without counting it.
+
+        Model absent from the registry is almost always a transient module
+        upgrade window; the job must be rescheduled 'pending' without burning
+        an attempt so it survives the reload (preprod 490 cv_reconcile
+        KeyError failures, 2026-07-17).
+        """
+        job_id = self._enqueue_plain(f"transient_{uuid.uuid4().hex}")
+        worker = QueueWorker(self.env.cr.dbname)
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            worker.handle_exception(
+                env["queue.job"].browse(job_id),
+                exc=TransientRegistryError("model gone", seconds=30, ignore_retry=True),
+            )
+        state, attempts = self._read_state_attempts(job_id)
+        self.assertEqual(state, "pending")
+        self.assertEqual(attempts, 0)
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            self.assertTrue(env["queue.job"].browse(job_id).scheduled_at)
+
+    def test_transient_registry_error_fails_aged_out_job(self):
+        """Past the age cap the model is presumed gone for good → fail, not loop."""
+        job_id = self._enqueue_plain(f"transient_aged_{uuid.uuid4().hex}")
+        with self.env.registry.cursor() as cr:
+            cr.execute(
+                "UPDATE queue_job SET create_date = NOW() - INTERVAL '2 hours' "
+                "WHERE id = %s",
+                (job_id,),
+            )
+            cr.commit()
+        worker = QueueWorker(
+            self.env.cr.dbname, transient_registry_max_age_seconds=3600
+        )
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            worker.handle_exception(
+                env["queue.job"].browse(job_id),
+                exc=TransientRegistryError("model gone", seconds=30, ignore_retry=True),
+            )
+        state, attempts = self._read_state_attempts(job_id)
+        self.assertEqual(state, "failed")
+        self.assertEqual(attempts, 0)
 
     def test_fresh_pending_pickup_does_not_increment_attempts(self):
         """A normal 'pending' pickup leaves attempts to the execute/timeout paths."""
