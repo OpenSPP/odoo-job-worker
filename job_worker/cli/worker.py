@@ -362,8 +362,9 @@ class QueueWorker:
             lock_timeout_ms=self.control_lock_timeout_ms,
         ) as cr:
             job_id = self.acquire_job_lock(cr)
-            if not job_id:
-                return None
+            # Commit unconditionally: acquire_job_lock may have marked a
+            # reclaim-exhausted job 'failed' and returned None, and that write
+            # must persist rather than roll back when the cursor closes.
             cr.commit()
             return job_id
 
@@ -415,7 +416,7 @@ class QueueWorker:
             limits AS (
                 SELECT name, "limit", rate_limit FROM queue_limit
             )
-            SELECT j.id
+            SELECT j.id, j.state, j.attempts, j.max_retries
             FROM queue_job j
             LEFT JOIN fresh_running_counts rc ON j.channel = rc.channel
             LEFT JOIN recent_starts_counts rsc ON j.channel = rsc.channel
@@ -442,9 +443,13 @@ class QueueWorker:
         """
         cr.execute(query, (stale_seconds, stale_seconds))
         res = cr.fetchone()
-        if res:
-            job_id = res[0]
-            # Mark as started and update heartbeat/worker_id
+        if not res:
+            return None
+        job_id, prior_state, attempts, max_retries = res
+
+        if prior_state != "started":
+            # Fresh 'pending' pickup. ``attempts`` is owned by the execution
+            # and timeout paths; leave it untouched here.
             cr.execute(
                 "UPDATE queue_job"
                 " SET state = 'started', heartbeat = NOW(),"
@@ -454,7 +459,57 @@ class QueueWorker:
                 (self.worker_uuid, job_id),
             )
             return job_id
-        return None
+
+        # Reclaiming a job still in 'started': the previous worker died or was
+        # killed mid-execution (OOM under limit_memory_hard, the stall
+        # watchdog's os._exit, a container restart) and its heartbeat went
+        # stale. That kind of death raises no in-process exception and, when
+        # the job has no per-attempt timeout, never trips _handle_timeout — so
+        # neither normal attempt-counting path ran. Count the reclaim as a
+        # failed attempt here, so a job that repeatedly kills its worker cannot
+        # be reclaimed and re-run forever (the "restarts but never finishes"
+        # loop): once it exhausts max_retries, fail it with a diagnostic
+        # instead of running it again.
+        attempts += 1
+        # max_retries == 0 means "retry infinitely" (matches _handle_timeout).
+        if max_retries and attempts > max_retries:
+            cr.execute(
+                "UPDATE queue_job"
+                " SET state = 'failed', attempts = %s, exc_info = %s,"
+                " completed_at = NOW(), worker_id = NULL, heartbeat = NULL,"
+                " write_date = NOW()"
+                " WHERE id = %s",
+                (
+                    attempts,
+                    "WorkerDiedJobError: reclaimed after the worker died or was "
+                    "killed mid-execution without completing (no exception, no "
+                    "timeout); exhausted max_retries.",
+                    job_id,
+                ),
+            )
+            _logger.error(
+                "Job %s exhausted max_retries (%s) after repeated worker "
+                "deaths; marking failed instead of reclaiming.",
+                job_id,
+                attempts,
+            )
+            return None
+
+        cr.execute(
+            "UPDATE queue_job"
+            " SET state = 'started', heartbeat = NOW(),"
+            " worker_id = %s, write_date = NOW(),"
+            " started_at = NOW(), attempts = %s"
+            " WHERE id = %s",
+            (self.worker_uuid, attempts, job_id),
+        )
+        _logger.warning(
+            "Reclaiming stale job %s (attempt %s); previous worker left it "
+            "'started' without completing.",
+            job_id,
+            attempts,
+        )
+        return job_id
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def _heartbeat_job(self, job_id):

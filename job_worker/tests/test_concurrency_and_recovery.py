@@ -109,6 +109,106 @@ class TestConcurrencyAndRecovery(TransactionCase):
             acquired_stale = worker.acquire_job_lock(cr_stale)
         self.assertEqual(acquired_stale, job_id)
 
+    def _enqueue_plain(self, channel):
+        with self.env.registry.cursor() as setup_cr:
+            setup_env = api.Environment(setup_cr, SUPERUSER_ID, {})
+            job = setup_env["queue.job"].enqueue(
+                model_name="res.users",
+                method_name="search",
+                record_ids=[],
+                args=[[("id", "=", setup_env.user.id)]],
+                kwargs={},
+                channel=channel,
+            )
+            job_id = job.id
+            setup_cr.commit()
+        return job_id
+
+    def _mark_started_stale(self, job_id):
+        with self.env.registry.cursor() as cr:
+            cr.execute(
+                "UPDATE queue_job SET state='started', worker_id='dead-worker',"
+                " heartbeat = NOW() - INTERVAL '120 seconds' WHERE id = %s",
+                (job_id,),
+            )
+            cr.commit()
+
+    def _read_state_attempts(self, job_id):
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            job = env["queue.job"].browse(job_id)
+            return job.state, job.attempts
+
+    def test_reclaim_counts_attempt_and_fails_when_max_retries_exhausted(self):
+        """A job that keeps killing its worker must not be reclaimed forever.
+
+        A worker killed as a process (OOM, stall-watchdog os._exit, container
+        restart) leaves its job in 'started' with a stale heartbeat and raises
+        no exception, so neither execute_job nor _handle_timeout counts the
+        attempt. The stale-recovery acquire path must therefore count each
+        reclaim as a failed attempt and, once max_retries is exhausted, mark
+        the job 'failed' instead of re-running it — otherwise the job restarts
+        forever with retries stuck at 0 (preprod cv_reconcile loop, 2026-07-17).
+        """
+        job_id = self._enqueue_plain(f"reclaim_{uuid.uuid4().hex}")
+        with self.env.registry.cursor() as cr:
+            cr.execute("UPDATE queue_job SET max_retries = 2 WHERE id = %s", (job_id,))
+            cr.commit()
+
+        worker = QueueWorker(self.env.cr.dbname)
+        db = odoo.sql_db.db_connect(self.env.cr.dbname)
+
+        # Reclaims 1 and 2 are within the cap: job is re-run, attempts climb.
+        for expected_attempt in (1, 2):
+            self._mark_started_stale(job_id)
+            with closing(db.cursor()) as cr:
+                acquired = worker.acquire_job_lock(cr)
+                cr.commit()
+            self.assertEqual(acquired, job_id)
+            self.assertEqual(
+                self._read_state_attempts(job_id), ("started", expected_attempt)
+            )
+
+        # Reclaim 3 exceeds max_retries=2: job is failed, NOT handed out.
+        self._mark_started_stale(job_id)
+        with closing(db.cursor()) as cr:
+            acquired = worker.acquire_job_lock(cr)
+            cr.commit()
+        self.assertIsNone(acquired)
+        state, attempts = self._read_state_attempts(job_id)
+        self.assertEqual(state, "failed")
+        self.assertEqual(attempts, 3)
+
+    def test_reclaim_with_infinite_retries_never_fails(self):
+        """max_retries == 0 means retry forever; a reclaim never fails the job."""
+        job_id = self._enqueue_plain(f"reclaim_inf_{uuid.uuid4().hex}")
+        with self.env.registry.cursor() as cr:
+            cr.execute("UPDATE queue_job SET max_retries = 0 WHERE id = %s", (job_id,))
+            cr.commit()
+
+        worker = QueueWorker(self.env.cr.dbname)
+        db = odoo.sql_db.db_connect(self.env.cr.dbname)
+        for expected_attempt in (1, 2, 3):
+            self._mark_started_stale(job_id)
+            with closing(db.cursor()) as cr:
+                acquired = worker.acquire_job_lock(cr)
+                cr.commit()
+            self.assertEqual(acquired, job_id)
+            self.assertEqual(
+                self._read_state_attempts(job_id), ("started", expected_attempt)
+            )
+
+    def test_fresh_pending_pickup_does_not_increment_attempts(self):
+        """A normal 'pending' pickup leaves attempts to the execute/timeout paths."""
+        job_id = self._enqueue_plain(f"fresh_{uuid.uuid4().hex}")
+        worker = QueueWorker(self.env.cr.dbname)
+        db = odoo.sql_db.db_connect(self.env.cr.dbname)
+        with closing(db.cursor()) as cr:
+            acquired = worker.acquire_job_lock(cr)
+            cr.commit()
+        self.assertEqual(acquired, job_id)
+        self.assertEqual(self._read_state_attempts(job_id), ("started", 0))
+
     def test_run_loop_wakes_quickly_on_notify(self):
         stop_event = Event()
         run_call_times = []
