@@ -125,6 +125,50 @@ volumes:
     jobs independently via `FOR UPDATE SKIP LOCKED`, so there is no double-execution
     risk.
 
+## Health checks
+
+The `QueueJobRunner` has no HTTP endpoint, so an orchestrator cannot probe it with
+an HTTP healthcheck. Instead the runner writes a small **heartbeat file** on every
+healthy iteration of its supervisor loop, and the bundled
+`job_worker_healthcheck.py` script reports whether that file is fresh.
+
+A stale heartbeat means one of:
+
+- the runner process is gone (the file is never refreshed),
+- the supervisor loop has stopped iterating (hung / deadlocked), or
+- the worker fleet is degraded — the runner deliberately withholds the heartbeat
+  while any database is quarantined (its worker has crashed past the failure
+  threshold), so a persistently broken database surfaces as unhealthy rather than
+  flapping after each rediscovery.
+
+The script imports only the standard library (it does **not** bootstrap Odoo), so
+it is fast enough to run as a container `HEALTHCHECK`:
+
+```yaml
+  job-worker:
+    image: your-odoo-image:19.0
+    command: python /mnt/extra-addons/odoo-job-worker/job_worker_runner.py -c /etc/odoo/odoo.conf
+    healthcheck:
+      test: ["CMD-SHELL", "python /mnt/extra-addons/odoo-job-worker/job_worker_healthcheck.py || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+    restart: unless-stopped
+```
+
+Both the writer and the checker resolve the same settings from the environment:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `JOB_WORKER_HEARTBEAT_FILE` | `/tmp/job_worker_heartbeat` | Path of the heartbeat file |
+| `JOB_WORKER_HEARTBEAT_MAX_AGE` | `60` | Seconds before the heartbeat is considered stale |
+
+!!! note "Runner-only"
+    The heartbeat is emitted by the multi-database `QueueJobRunner`. A bare
+    single-database `QueueWorker` (as shown in the example above) does not write a
+    heartbeat file.
+
 ## systemd Service
 
 Create a systemd unit for the worker:

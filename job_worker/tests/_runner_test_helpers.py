@@ -69,6 +69,19 @@ def load_runner():
     cli_stub = sys.modules["job_worker.cli"]
     cli_stub.worker = worker_stub
 
+    # Load the real heartbeat module (standard-library only, no Odoo) so the
+    # runner's ``from .heartbeat import ...`` resolves to the genuine
+    # implementation rather than a stub.
+    heartbeat_path = os.path.join(cli_dir, "heartbeat.py")
+    heartbeat_spec = importlib.util.spec_from_file_location(
+        "job_worker.cli.heartbeat", heartbeat_path
+    )
+    heartbeat_mod = importlib.util.module_from_spec(heartbeat_spec)
+    heartbeat_mod.__package__ = "job_worker.cli"
+    heartbeat_spec.loader.exec_module(heartbeat_mod)
+    sys.modules["job_worker.cli.heartbeat"] = heartbeat_mod
+    cli_stub.heartbeat = heartbeat_mod
+
     # Load the runner module as part of the job_worker.cli package
     runner_path = os.path.join(cli_dir, "runner.py")
     spec = importlib.util.spec_from_file_location(
