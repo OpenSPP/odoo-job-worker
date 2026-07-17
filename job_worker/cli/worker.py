@@ -17,7 +17,7 @@ from psycopg2.extensions import ISOLATION_LEVEL_READ_COMMITTED
 import odoo
 from odoo import api, fields
 
-from ..exception import RetryableJobError
+from ..exception import RetryableJobError, TransientRegistryError
 
 _logger = logging.getLogger(__name__)
 
@@ -159,6 +159,7 @@ class QueueWorker:
         registry_check_interval=30,
         statement_timeout_seconds=30,
         lock_timeout_seconds=10,
+        transient_registry_max_age_seconds=3600,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -171,6 +172,13 @@ class QueueWorker:
         self.max_backoff_seconds = max(10, int(max_backoff_seconds))
         self.concurrency = max(1, int(concurrency))
         self.registry_check_interval = max(5, int(registry_check_interval))
+        # How long (seconds) to keep retrying a job whose model is missing from
+        # the registry WITHOUT counting attempts (a transient module
+        # install/upgrade window). Past this age the model is presumed gone for
+        # good and the job is failed rather than looping forever.
+        self.transient_registry_max_age_seconds = max(
+            0, int(transient_registry_max_age_seconds)
+        )
         # Control-plane query timeouts (ms), applied via SET LOCAL to the
         # heartbeat/acquire cursors only — NOT the job-execution path. A
         # blocked main-loop query then raises instead of hanging the worker
@@ -362,8 +370,9 @@ class QueueWorker:
             lock_timeout_ms=self.control_lock_timeout_ms,
         ) as cr:
             job_id = self.acquire_job_lock(cr)
-            if not job_id:
-                return None
+            # Commit unconditionally: acquire_job_lock may have marked a
+            # reclaim-exhausted job 'failed' and returned None, and that write
+            # must persist rather than roll back when the cursor closes.
             cr.commit()
             return job_id
 
@@ -415,7 +424,7 @@ class QueueWorker:
             limits AS (
                 SELECT name, "limit", rate_limit FROM queue_limit
             )
-            SELECT j.id
+            SELECT j.id, j.state, j.attempts, j.max_retries, j.graph_uuid
             FROM queue_job j
             LEFT JOIN fresh_running_counts rc ON j.channel = rc.channel
             LEFT JOIN recent_starts_counts rsc ON j.channel = rsc.channel
@@ -442,9 +451,13 @@ class QueueWorker:
         """
         cr.execute(query, (stale_seconds, stale_seconds))
         res = cr.fetchone()
-        if res:
-            job_id = res[0]
-            # Mark as started and update heartbeat/worker_id
+        if not res:
+            return None
+        job_id, prior_state, attempts, max_retries, graph_uuid = res
+
+        if prior_state != "started":
+            # Fresh 'pending' pickup. ``attempts`` is owned by the execution
+            # and timeout paths; leave it untouched here.
             cr.execute(
                 "UPDATE queue_job"
                 " SET state = 'started', heartbeat = NOW(),"
@@ -454,7 +467,78 @@ class QueueWorker:
                 (self.worker_uuid, job_id),
             )
             return job_id
-        return None
+
+        # Reclaiming a job still in 'started': the previous worker died or was
+        # killed mid-execution (OOM under limit_memory_hard, the stall
+        # watchdog's os._exit, a container restart) and its heartbeat went
+        # stale. That kind of death raises no in-process exception and, when
+        # the job has no per-attempt timeout, never trips _handle_timeout — so
+        # neither normal attempt-counting path ran. Count the reclaim as a
+        # failed attempt here, so a job that repeatedly kills its worker cannot
+        # be reclaimed and re-run forever (the "restarts but never finishes"
+        # loop): once it exhausts max_retries, fail it with a diagnostic
+        # instead of running it again.
+        # ``attempts`` may be NULL for rows created before the column existed;
+        # coerce so the arithmetic and the > comparison below are safe.
+        attempts = (attempts or 0) + 1
+        # max_retries == 0 means "retry infinitely" (matches _handle_timeout).
+        if max_retries and attempts > max_retries:
+            reason = (
+                "WorkerDiedJobError: reclaimed after the worker died or was "
+                "killed mid-execution without completing (no exception, no "
+                "timeout); exhausted max_retries."
+            )
+            cr.execute(
+                "UPDATE queue_job"
+                " SET state = 'failed', attempts = %s, exc_info = %s,"
+                " completed_at = NOW(), worker_id = NULL, heartbeat = NULL,"
+                " write_date = NOW()"
+                " WHERE id = %s",
+                (attempts, reason, job_id),
+            )
+            # Cascade the failure so dependents don't hang in 'waiting' forever
+            # (mirrors handle_exception's _cascade_failure_to_dependents, but in
+            # raw SQL — this control-plane path has no ORM env). Waiting
+            # children first, then multi-parent graph-barrier dependents.
+            cascade_reason = f"Parent job {job_id} failed (worker died)"
+            cr.execute(
+                "UPDATE queue_job"
+                " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                " WHERE parent_id = %s AND state = 'waiting'",
+                (cascade_reason, job_id),
+            )
+            if graph_uuid:
+                cr.execute(
+                    "UPDATE queue_job"
+                    " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                    " WHERE graph_uuid = %s AND state = 'waiting'"
+                    " AND dependency_job_ids IS NOT NULL"
+                    " AND dependency_job_ids @> (%s)::jsonb",
+                    (cascade_reason, graph_uuid, json.dumps([job_id])),
+                )
+            _logger.error(
+                "Job %s exhausted max_retries (%s) after repeated worker "
+                "deaths; marking failed instead of reclaiming.",
+                job_id,
+                attempts,
+            )
+            return None
+
+        cr.execute(
+            "UPDATE queue_job"
+            " SET state = 'started', heartbeat = NOW(),"
+            " worker_id = %s, write_date = NOW(),"
+            " started_at = NOW(), attempts = %s"
+            " WHERE id = %s",
+            (self.worker_uuid, attempts, job_id),
+        )
+        _logger.warning(
+            "Reclaiming stale job %s (attempt %s); previous worker left it "
+            "'started' without completing.",
+            job_id,
+            attempts,
+        )
+        return job_id
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def _heartbeat_job(self, job_id):
@@ -702,7 +786,23 @@ class QueueWorker:
             args = payload.get("args", [])
             kwargs = payload.get("kwargs", {})
             record_ids = payload.get("ids")
-            run_model = run_env[model_name].with_company(run_company_id)
+            try:
+                run_model = run_env[model_name].with_company(run_company_id)
+            except KeyError as key_exc:
+                # Model absent from this worker's registry — almost always a
+                # transient module install/upgrade window (the registry is
+                # reloaded every registry_check_interval via check_signaling).
+                # Retry without burning an attempt so the job survives the
+                # upgrade instead of exhausting max_retries; handle_exception
+                # bounds this by job age so a genuinely removed model still
+                # fails eventually.
+                raise TransientRegistryError(
+                    f"Model {model_name!r} is not in the registry yet "
+                    f"(worker registry may be mid-reload during a module "
+                    f"install/upgrade); retrying without counting the attempt.",
+                    seconds=self.registry_check_interval,
+                    ignore_retry=True,
+                ) from key_exc
 
             # Execute
             if record_ids:
@@ -837,6 +937,59 @@ class QueueWorker:
         tb = traceback.format_exc()
         job.exc_info = tb
 
+        # Model missing from the registry: retry WITHOUT counting the attempt
+        # while the job is young enough to be inside a plausible module
+        # install/upgrade window; once it ages past the cap, treat the model as
+        # permanently gone and fail (so a renamed/removed model can't loop
+        # forever). Checked before the generic RetryableJobError branch because
+        # TransientRegistryError subclasses it.
+        if isinstance(exc, TransientRegistryError):
+            age_seconds = 0.0
+            if job.create_date:
+                age_seconds = (fields.Datetime.now() - job.create_date).total_seconds()
+            if age_seconds < self.transient_registry_max_age_seconds:
+                delay_seconds = exc.seconds or self.registry_check_interval
+                job.state = "pending"
+                job.scheduled_at = fields.Datetime.now() + datetime.timedelta(
+                    seconds=delay_seconds
+                )
+                job.worker_id = False
+                job.heartbeat = False
+                _logger.warning(
+                    "Job %s model missing from registry (age %.0fs < %ss cap); "
+                    "retrying in %ds without counting the attempt (stays %s).",
+                    job.id,
+                    age_seconds,
+                    self.transient_registry_max_age_seconds,
+                    delay_seconds,
+                    job.attempts,
+                )
+                job.env.cr.commit()
+                return
+            job.state = "failed"
+            job.completed_at = fields.Datetime.now()
+            if job.started_at:
+                job.duration = max(
+                    0.0,
+                    (
+                        fields.Datetime.to_datetime(job.completed_at)
+                        - fields.Datetime.to_datetime(job.started_at)
+                    ).total_seconds(),
+                )
+            job.scheduled_at = False
+            job.worker_id = False
+            job.heartbeat = False
+            self._cascade_failure_to_dependents(job, f"Parent job {job.id} failed")
+            _logger.error(
+                "Job %s model still missing from registry after %.0fs (> %ss cap); "
+                "failing — the model appears to be permanently removed.",
+                job.id,
+                age_seconds,
+                self.transient_registry_max_age_seconds,
+            )
+            job.env.cr.commit()
+            return
+
         if isinstance(exc, RetryableJobError):
             if not exc.ignore_retry:
                 job.attempts += 1
@@ -898,29 +1051,31 @@ class QueueWorker:
             job.scheduled_at = False
             job.worker_id = False
             job.heartbeat = False
-            # Cascade failure to waiting children
-            for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
-                child.state = "failed"
-                child.exc_info = f"Parent job {job.id} failed"
-            # Cascade failure to multi-parent dependents (group barriers)
-            if job.graph_uuid:
-                job.env.cr.execute(
-                    """
-                    UPDATE queue_job
-                    SET state = 'failed',
-                        exc_info = %s,
-                        write_date = NOW()
-                    WHERE graph_uuid = %s
-                      AND state = 'waiting'
-                      AND dependency_job_ids IS NOT NULL
-                      AND dependency_job_ids @> (%s)::jsonb
-                    """,
-                    (
-                        f"Parent job {job.id} failed",
-                        job.graph_uuid,
-                        json.dumps([job.id]),
-                    ),
-                )
+            self._cascade_failure_to_dependents(job, f"Parent job {job.id} failed")
             _logger.error("Job %s failed permanently.\n%s", job.id, tb)
 
         job.env.cr.commit()
+
+    def _cascade_failure_to_dependents(self, job, reason):
+        """Fail this job's waiting children and group-barrier dependents.
+
+        Shared by the permanent-failure paths so a failed parent does not
+        leave dependents stuck in 'waiting' forever.
+        """
+        for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
+            child.state = "failed"
+            child.exc_info = reason
+        if job.graph_uuid:
+            job.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET state = 'failed',
+                    exc_info = %s,
+                    write_date = NOW()
+                WHERE graph_uuid = %s
+                  AND state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                """,
+                (reason, job.graph_uuid, json.dumps([job.id])),
+            )
