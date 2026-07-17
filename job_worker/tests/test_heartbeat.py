@@ -89,6 +89,15 @@ class TestHeartbeatFile(unittest.TestCase):
             handle.write("garbage")
         self.assertFalse(heartbeat.is_fresh(self.path, max_age=60))
 
+    def test_read_caps_read_size_for_oversized_file(self):
+        # A corrupted/tampered heartbeat may be arbitrarily large; only a
+        # small prefix is ever read, so the healthcheck stays O(1) and the
+        # unparseable prefix reports stale rather than blowing up.
+        with open(self.path, "w") as handle:
+            handle.write("x" * 1_000_000)
+        self.assertIsNone(heartbeat.read_heartbeat(self.path))
+        self.assertFalse(heartbeat.is_fresh(self.path, max_age=60))
+
     def test_write_is_atomic_no_leftover_tmp(self):
         heartbeat.write_heartbeat(self.path)
         leftovers = [

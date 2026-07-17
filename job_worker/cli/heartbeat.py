@@ -85,7 +85,9 @@ def read_heartbeat(path=None):
         path = heartbeat_file_path()
     try:
         with open(path) as handle:
-            content = handle.read().strip()
+            # A valid heartbeat is a ~20-char float repr; cap the read so a
+            # corrupted or tampered file can never balloon the healthcheck.
+            content = handle.read(100).strip()
     except OSError:
         return None
     if not content:

@@ -20,7 +20,9 @@ import sys
 # Import the heartbeat helper directly from the cli package directory
 # without importing the ``job_worker`` Odoo addon package (whose __init__
 # pulls in Odoo and psycopg2).  The helper uses only the standard library.
-_CLI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "job_worker", "cli")
+_CLI_DIR = os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "job_worker", "cli"
+)
 sys.path.insert(0, _CLI_DIR)
 
 import heartbeat  # noqa: E402  (import deferred until sys.path is set)
