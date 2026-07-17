@@ -199,6 +199,48 @@ class TestConcurrencyAndRecovery(TransactionCase):
                 self._read_state_attempts(job_id), ("started", expected_attempt)
             )
 
+    def test_reclaim_exhausted_cascades_failure_to_waiting_child(self):
+        """A reclaim that exhausts max_retries fails its waiting children too.
+
+        Otherwise a chain/group whose parent's worker dies would leave the
+        dependents stuck in 'waiting' forever (mirrors the cascade the normal
+        permanent-failure path already performs).
+        """
+        parent_id = self._enqueue_plain(f"reclaim_casc_{uuid.uuid4().hex}")
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            child = env["queue.job"].enqueue(
+                model_name="res.users",
+                method_name="search",
+                record_ids=[],
+                args=[[("id", "=", env.user.id)]],
+                kwargs={},
+                channel=f"reclaim_casc_child_{uuid.uuid4().hex}",
+            )
+            child.write({"state": "waiting", "parent_id": parent_id})
+            child_id = child.id
+            cr.execute(
+                "UPDATE queue_job SET max_retries = 1 WHERE id = %s", (parent_id,)
+            )
+            cr.commit()
+
+        worker = QueueWorker(self.env.cr.dbname)
+        db = odoo.sql_db.db_connect(self.env.cr.dbname)
+        # Reclaim 1 (attempt 1 == cap): re-run.
+        self._mark_started_stale(parent_id)
+        with closing(db.cursor()) as cr:
+            self.assertEqual(worker.acquire_job_lock(cr), parent_id)
+            cr.commit()
+        # Reclaim 2 (attempt 2 > cap): parent failed, child cascaded to failed.
+        self._mark_started_stale(parent_id)
+        with closing(db.cursor()) as cr:
+            self.assertIsNone(worker.acquire_job_lock(cr))
+            cr.commit()
+        self.assertEqual(self._read_state_attempts(parent_id), ("failed", 2))
+        with self.env.registry.cursor() as cr:
+            env = api.Environment(cr, SUPERUSER_ID, {})
+            self.assertEqual(env["queue.job"].browse(child_id).state, "failed")
+
     def test_transient_registry_error_retries_young_job_without_attempt(self):
         """A missing-model error on a young job retries without counting it.
 

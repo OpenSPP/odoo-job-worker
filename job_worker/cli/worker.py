@@ -424,7 +424,7 @@ class QueueWorker:
             limits AS (
                 SELECT name, "limit", rate_limit FROM queue_limit
             )
-            SELECT j.id, j.state, j.attempts, j.max_retries
+            SELECT j.id, j.state, j.attempts, j.max_retries, j.graph_uuid
             FROM queue_job j
             LEFT JOIN fresh_running_counts rc ON j.channel = rc.channel
             LEFT JOIN recent_starts_counts rsc ON j.channel = rsc.channel
@@ -453,7 +453,7 @@ class QueueWorker:
         res = cr.fetchone()
         if not res:
             return None
-        job_id, prior_state, attempts, max_retries = res
+        job_id, prior_state, attempts, max_retries, graph_uuid = res
 
         if prior_state != "started":
             # Fresh 'pending' pickup. ``attempts`` is owned by the execution
@@ -478,23 +478,44 @@ class QueueWorker:
         # be reclaimed and re-run forever (the "restarts but never finishes"
         # loop): once it exhausts max_retries, fail it with a diagnostic
         # instead of running it again.
-        attempts += 1
+        # ``attempts`` may be NULL for rows created before the column existed;
+        # coerce so the arithmetic and the > comparison below are safe.
+        attempts = (attempts or 0) + 1
         # max_retries == 0 means "retry infinitely" (matches _handle_timeout).
         if max_retries and attempts > max_retries:
+            reason = (
+                "WorkerDiedJobError: reclaimed after the worker died or was "
+                "killed mid-execution without completing (no exception, no "
+                "timeout); exhausted max_retries."
+            )
             cr.execute(
                 "UPDATE queue_job"
                 " SET state = 'failed', attempts = %s, exc_info = %s,"
                 " completed_at = NOW(), worker_id = NULL, heartbeat = NULL,"
                 " write_date = NOW()"
                 " WHERE id = %s",
-                (
-                    attempts,
-                    "WorkerDiedJobError: reclaimed after the worker died or was "
-                    "killed mid-execution without completing (no exception, no "
-                    "timeout); exhausted max_retries.",
-                    job_id,
-                ),
+                (attempts, reason, job_id),
             )
+            # Cascade the failure so dependents don't hang in 'waiting' forever
+            # (mirrors handle_exception's _cascade_failure_to_dependents, but in
+            # raw SQL — this control-plane path has no ORM env). Waiting
+            # children first, then multi-parent graph-barrier dependents.
+            cascade_reason = f"Parent job {job_id} failed (worker died)"
+            cr.execute(
+                "UPDATE queue_job"
+                " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                " WHERE parent_id = %s AND state = 'waiting'",
+                (cascade_reason, job_id),
+            )
+            if graph_uuid:
+                cr.execute(
+                    "UPDATE queue_job"
+                    " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                    " WHERE graph_uuid = %s AND state = 'waiting'"
+                    " AND dependency_job_ids IS NOT NULL"
+                    " AND dependency_job_ids @> (%s)::jsonb",
+                    (cascade_reason, graph_uuid, json.dumps([job_id])),
+                )
             _logger.error(
                 "Job %s exhausted max_retries (%s) after repeated worker "
                 "deaths; marking failed instead of reclaiming.",
