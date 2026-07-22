@@ -103,7 +103,9 @@ partner.with_delay(identity_key=identity_exact).sync_to_external_system()
 ```
 
 `identity_exact` hashes `(model_name, method_name, record_ids, args, kwargs)` into a
-SHA-1 digest. This means two calls with identical arguments produce the same key.
+SHA-1 digest, so two calls with identical arguments produce the same key. Record IDs
+and keyword arguments are sorted before hashing (order-independent); positional
+`args` are hashed in the order given.
 
 !!! info "Enforcement"
     Deduplication is enforced by a partial unique index on `identity_key` for active

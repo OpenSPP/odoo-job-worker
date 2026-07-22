@@ -39,7 +39,7 @@ include:
 
 ### Duration Buckets (Job View)
 
-Jobs are categorized by execution time using `queue.job.duration_bucket`:
+Jobs are categorized by execution time using the `duration_bucket` field on `queue.job`:
 
 | Bucket | Duration |
 |---|---|
@@ -56,7 +56,7 @@ problems:
 
 - **Failed job threshold** — Alert when failed job count exceeds a limit
 - **Queue depth threshold** — Alert when pending jobs exceed a limit
-- **Stale job detection** — Alert when started jobs have old heartbeats
+- **Stale Workers** — Alert when started jobs have old heartbeats
 - **P95 duration threshold** — Alert when tail latency degrades
 - **Average wait time threshold** — Alert when jobs wait too long before start
 

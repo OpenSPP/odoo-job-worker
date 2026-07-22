@@ -22,34 +22,24 @@ Or install via the Odoo UI: **Apps > Search "Job Worker" > Install**.
 
 ## Start a Worker
 
-The worker is a standalone process that pulls and executes jobs. Create a launcher
-script:
-
-```python
-# run_worker.py
-import odoo
-from odoo.tools import config
-
-from odoo.addons.job_worker.cli.worker import QueueWorker
-
-config.parse_config([
-    "-c", "/etc/odoo/odoo.conf",
-    "-d", "<db_name>",
-])
-
-odoo.service.server.load_server_wide_modules()
-registry = odoo.modules.registry.Registry(config["db_name"])
-
-worker = QueueWorker(config["db_name"])
-worker.run()
-```
+The runner is a standalone process that discovers your databases, pulls jobs, and
+executes them. Start it with the bundled launcher:
 
 ```bash
-python run_worker.py
+python job_worker_runner.py -c /etc/odoo/odoo.conf
 ```
 
+Or invoke it as a module:
+
+```bash
+python -m odoo.addons.job_worker.cli -c /etc/odoo/odoo.conf
+```
+
+Both entry points start the multi-database `QueueJobRunner`, which supervises a
+worker per database with `job_worker` installed.
+
 See [Deployment](deployment.md) for production setup with Docker, systemd, and the
-multi-database runner.
+container healthcheck.
 
 ## Enqueue Your First Job
 
@@ -59,7 +49,7 @@ In any Odoo server action, cron, or Python shell:
 
 ```python
 partner = env["res.partner"].browse(1)
-job = partner.with_delay(priority=5, channel="default").write({"name": "Hello from the queue!"})
+job = partner.with_delay(priority=5, channel="root").write({"name": "Hello from the queue!"})
 ```
 
 The method call is captured and stored as a job record. The worker picks it up and
@@ -69,7 +59,7 @@ executes `partner.write({"name": "Hello from the queue!"})` in the background.
 
 ```python
 partner = env["res.partner"].browse(1)
-delayable = partner.delayable(priority=5, channel="default")
+delayable = partner.delayable(priority=5, channel="root")
 delayable.write({"name": "Hello from the queue!"})
 job = delayable.delay()
 ```
@@ -86,7 +76,7 @@ job = env["queue.job"].enqueue(
     record_ids=[1],
     args=[{"name": "Hello from the queue!"}],
     kwargs={},
-    channel="default",
+    channel="root",
     priority=5,
 )
 ```

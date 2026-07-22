@@ -39,7 +39,7 @@ bash docker/run_tests.sh job_worker_monitor
 
 The script:
 
-1. Starts a PostgreSQL 16 container
+1. Starts a PostgreSQL 18 container
 2. Creates a test database per module
 3. Runs `odoo --test-enable --test-tags /<module> --stop-after-init`
 4. Reports pass/fail based on test output
@@ -103,12 +103,12 @@ uv run mkdocs serve
 Then open [http://localhost:8000](http://localhost:8000).
 
 Documentation source files are in the `docs/` directory. The site is
-automatically built and deployed to GitHub Pages on push to `main`.
+automatically built and deployed to GitHub Pages on push to `19.0`.
 
 ## Submitting Changes
 
 1. Fork the repository
-2. Create a feature branch from `main`
+2. Create a feature branch from `19.0`
 3. Make your changes with tests
 4. Run the test suite to verify
 5. Submit a pull request

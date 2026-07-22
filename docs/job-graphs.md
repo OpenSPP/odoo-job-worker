@@ -87,6 +87,31 @@ main.on_done(
 main.delay()
 ```
 
+## Error Callbacks with `on_error()`
+
+`on_error()` is the failure-path sibling of `on_done()`. Attach a callback that
+runs only if the main job resolves to `failed`:
+
+```python
+main = record.delayable().do_heavy_work()
+cleanup = record.delayable().rollback_partial_work()
+main.on_error(cleanup)
+main.delay()
+```
+
+Like an `on_done()` callback, the `on_error()` callback starts in `waiting` state.
+Then:
+
+- If the main job **succeeds**, the callback is automatically **cancelled** (moved
+  to `cancelled`) — it never runs.
+- If the main job **fails permanently**, the callback is promoted to `pending` and
+  executed.
+
+`on_error()` is available on `Delayable`, `DelayableGroup`, and `DelayableChain`, so
+you can attach failure handlers to a single job, a group barrier, or a chain. You
+can combine it with `on_done()` on the same job to run one callback on success and a
+different one on failure.
+
 ## Splitting Recordsets
 
 `split()` breaks a large recordset into chunked jobs:

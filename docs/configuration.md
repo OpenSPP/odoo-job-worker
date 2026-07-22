@@ -12,13 +12,28 @@ The `QueueWorker` class accepts these parameters:
 | `stale_after_seconds` | `60` | Jobs without a heartbeat for this long are considered stale and eligible for recovery |
 | `heartbeat_interval_seconds` | `15` | How often the worker sends heartbeats for running jobs |
 | `max_backoff_seconds` | `3600` | Maximum retry delay (exponential backoff caps here) |
+| `registry_check_interval` | `30` | Seconds between checks for a reloaded Odoo registry (picks up newly installed/upgraded modules without a restart) |
+| `statement_timeout_seconds` | `30` | Per-statement timeout applied to control-plane cursors |
+| `lock_timeout_seconds` | `10` | Lock-acquisition timeout applied to control-plane cursors |
+| `transient_registry_max_age_seconds` | `3600` | How long a transient registry error is retried without counting toward `max_retries` |
 
 ### Environment Variables
 
+These are read by `QueueJobRunner.from_environ_or_config()`, which both bundled
+entry points (`job_worker_runner.py` and `python -m odoo.addons.job_worker.cli`)
+use:
+
 | Variable | Default | Description |
 |---|---|---|
-| `QUEUE_JOB_CONCURRENCY` | `2` | Worker thread pool size when using `QueueJobRunner.from_environ_or_config()` |
+| `QUEUE_JOB_CONCURRENCY` | `2` | Worker thread pool size per database |
+| `QUEUE_JOB_STATEMENT_TIMEOUT` | `30` | Per-statement timeout (seconds) applied to worker cursors |
+| `QUEUE_JOB_LOCK_TIMEOUT` | `10` | Lock-acquisition timeout (seconds) for worker cursors |
+| `QUEUE_JOB_WORKER_STALL_TIMEOUT` | `120` | Seconds before a stalled worker thread is restarted |
+| `QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK` | `1` | Set to `0`/`false` to allow multiple supervisors per database (stress testing) |
 | `QUEUE_JOB__NO_DELAY` | (unset) | Set to `1` to force synchronous job execution |
+
+The runner also reads the heartbeat settings `JOB_WORKER_HEARTBEAT_FILE` and
+`JOB_WORKER_HEARTBEAT_MAX_AGE`; see [Deployment](deployment.md#health-checks).
 
 ## Runner Parameters
 
@@ -27,10 +42,11 @@ The `QueueJobRunner` supervises workers across multiple databases.
 | Parameter | Default | Description |
 |---|---|---|
 | `database_names` | (auto-discover) | List of databases to process; `None` means auto-discover |
-| `discovery_interval_seconds` | `300` | Seconds between database discovery cycles |
+| `discovery_interval_seconds` | `60` | Seconds between database discovery cycles |
 | `maximum_consecutive_failures` | `5` | Failures within the window before a database is quarantined |
 | `failure_window_seconds` | `300` | Time window used for failure counting |
 | `join_timeout_seconds` | `30` | Seconds to wait for a worker thread to stop |
+| `worker_stall_timeout_seconds` | `120` | A worker whose thread stops making progress for this long is treated as stalled and restarted |
 
 The runner uses PostgreSQL advisory locks to prevent duplicate runners on the same
 databases.
