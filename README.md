@@ -6,11 +6,14 @@ High-performance, SQL-driven background job engine for Odoo.
 
 ## Description
 
-This repository provides three Odoo modules for background job processing:
+This repository provides three end-user Odoo modules for background job processing:
 
 - **job_worker** — Core queue engine with a persistent `queue.job` model, SQL pull worker (`FOR UPDATE SKIP LOCKED`) with PostgreSQL `LISTEN/NOTIFY` wakeups, channel-level concurrency and rate limiting, and developer APIs compatible with `with_delay()` / `delayable()` patterns.
 - **job_worker_demo** — Interactive demo companion for exploring the queue system.
 - **job_worker_monitor** — Dashboard, metrics, and alerting for queue operations.
+
+A fourth module, **job_worker_stress**, ships test-only job bodies used by the
+stress suite. It is not auto-installed and is not intended for production.
 
 ## Requirements
 
@@ -35,37 +38,33 @@ odoo -d <db_name> \
 
 ### Start a Worker Process
 
-The worker class is `odoo.addons.job_worker.cli.worker.QueueWorker`.
+Run the bundled runner as a dedicated process/service. The runner
+(`QueueJobRunner`) discovers every database with `job_worker` installed and
+supervises a worker per database, restarting crashed workers and writing a
+liveness heartbeat file.
 
-Basic launcher (recommended as a dedicated process/service):
-
-```python
-# run_worker.py
-import odoo
-from odoo.tools import config
-
-from odoo.addons.job_worker.cli.worker import QueueWorker
-
-config.parse_config([
-    "-c", "/etc/odoo/odoo.conf",
-    "-d", "<db_name>",
-])
-
-odoo.service.server.load_server_wide_modules()
-registry = odoo.modules.registry.Registry(config["db_name"])
-
-worker = QueueWorker(config["db_name"])
-worker.run()
-```
-
-Then run:
+Standalone launcher script:
 
 ```bash
-python run_worker.py
+python job_worker_runner.py -c /etc/odoo/odoo.conf
 ```
 
+Or invoke the runner as a module:
+
+```bash
+python -m odoo.addons.job_worker.cli -c /etc/odoo/odoo.conf
+```
+
+Both entry points call `QueueJobRunner.from_environ_or_config()`, which reads
+runner settings from the environment (see the [Deployment](https://openspp.github.io/odoo-job-worker/deployment/)
+and [Configuration](https://openspp.github.io/odoo-job-worker/configuration/) guides).
+
+For container orchestration, `job_worker_healthcheck.py` is a fast,
+Odoo-free script that exits `0` while the runner's heartbeat file is fresh and
+`1` otherwise — suitable as a Docker `HEALTHCHECK`.
+
 Operational notes:
-- Worker listens on channel `queue_job_wake_up`.
+- Workers listen on channel `queue_job_wake_up`.
 - Jobs are recovered if stale (`started` + old/missing heartbeat).
 - Retry backoff is exponential: 10s, 20s, 40s, ... until `max_retries`.
 

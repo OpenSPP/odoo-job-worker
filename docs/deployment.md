@@ -2,10 +2,37 @@
 
 ## Worker Process
 
-The worker is a standalone Python process that connects to your Odoo database and
-continuously pulls and executes jobs.
+The runner is a standalone Python process that connects to your Odoo databases and
+continuously pulls and executes jobs. It is the recommended way to run jobs in
+production.
 
-### Single-Database Worker
+### Runner (recommended)
+
+Use one of the two bundled entry points. Both start the multi-database
+`QueueJobRunner` via `QueueJobRunner.from_environ_or_config()`, so runner settings
+are read from the environment (see [Configuration](configuration.md)).
+
+```bash
+# Standalone launcher script
+python job_worker_runner.py -c /etc/odoo/odoo.conf
+
+# Or invoke the runner as a module
+python -m odoo.addons.job_worker.cli -c /etc/odoo/odoo.conf
+```
+
+The runner:
+
+- Discovers databases with `job_worker` installed
+- Spawns a `QueueWorker` thread per database
+- Monitors thread health and restarts crashed workers
+- Quarantines databases with repeated failures
+- Uses PostgreSQL advisory locks to prevent duplicate runners
+- Writes a heartbeat file for container health checks (see below)
+
+### Single-Database Worker (advanced)
+
+If you need to run a single unsupervised worker for one database — for example in a
+constrained container — you can instantiate `QueueWorker` directly:
 
 ```python
 # run_worker.py
@@ -26,31 +53,10 @@ worker = QueueWorker(config["db_name"])
 worker.run()
 ```
 
-### Multi-Database Runner
-
-For environments with multiple Odoo databases, use the `QueueJobRunner` which
-auto-discovers databases and manages per-database worker threads:
-
-```python
-# run_runner.py
-import odoo
-from odoo.tools import config
-
-from odoo.addons.job_worker.cli.runner import QueueJobRunner
-
-config.parse_config(["-c", "/etc/odoo/odoo.conf"])
-
-runner = QueueJobRunner()
-runner.run()
-```
-
-The runner:
-
-- Discovers databases with `job_worker` installed
-- Spawns a `QueueWorker` thread per database
-- Monitors thread health and restarts crashed workers
-- Quarantines databases with repeated failures
-- Uses PostgreSQL advisory locks to prevent duplicate runners
+!!! warning "No supervision or heartbeat"
+    A bare `QueueWorker` is not restarted on crash and does **not** write the
+    heartbeat file the container healthcheck relies on. Prefer the runner unless you
+    have a specific reason not to.
 
 ## Signals
 
@@ -61,12 +67,14 @@ The runner:
 
 ## Docker Compose
 
-Example `docker-compose.yml` for running the job worker alongside Odoo:
+Example `docker-compose.yml` for running the job worker alongside Odoo. This is a
+generic illustration; the repository's own `docker/docker-compose.yml` is a
+test harness, not a production template.
 
 ```yaml
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: odoo
       POSTGRES_USER: odoo
@@ -104,16 +112,7 @@ services:
       - HOST=postgres
       - USER=odoo
       - PASSWORD=odoo
-    command: >
-      python -c "
-      import odoo;
-      from odoo.tools import config;
-      config.parse_config(['-c', '/etc/odoo/odoo.conf', '-d', 'odoo']);
-      odoo.service.server.load_server_wide_modules();
-      odoo.modules.registry.Registry(config['db_name']);
-      from odoo.addons.job_worker.cli.worker import QueueWorker;
-      QueueWorker(config['db_name']).run()
-      "
+    command: python /mnt/extra-addons/odoo-job-worker/job_worker_runner.py -c /etc/odoo/odoo.conf
     restart: unless-stopped
 
 volumes:
@@ -166,8 +165,8 @@ Both the writer and the checker resolve the same settings from the environment:
 
 !!! note "Runner-only"
     The heartbeat is emitted by the multi-database `QueueJobRunner`. A bare
-    single-database `QueueWorker` (as shown in the example above) does not write a
-    heartbeat file.
+    single-database `QueueWorker` (see [Single-Database Worker](#single-database-worker-advanced))
+    does not write a heartbeat file.
 
 ## systemd Service
 
@@ -184,7 +183,7 @@ Requires=postgresql.service
 Type=simple
 User=odoo
 Group=odoo
-ExecStart=/usr/bin/python3 /opt/odoo/run_worker.py
+ExecStart=/usr/bin/python3 /opt/odoo/addons/odoo-job-worker/job_worker_runner.py -c /etc/odoo/odoo.conf
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

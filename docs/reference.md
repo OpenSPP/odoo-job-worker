@@ -157,6 +157,18 @@ On timeout, the worker updates job state internally and writes
 `TimeoutJobError: ...` into `exc_info`; timeout handling then follows the standard
 retry logic unless `max_retries` is exhausted.
 
+### `TransientRegistryError`
+
+A `RetryableJobError` subclass raised internally when the target model is
+temporarily unavailable because the Odoo registry is being reloaded (e.g. during a
+module install/upgrade). The worker retries the job **without** counting the attempt
+toward `max_retries`, for up to `transient_registry_max_age_seconds`, so jobs are
+not consumed while the registry settles.
+
+```python
+from odoo.addons.job_worker.exception import TransientRegistryError
+```
+
 ## Constants
 
 ```python
@@ -184,6 +196,7 @@ from odoo.addons.job_worker.job import (
 | `button_requeue()` | Reset to `pending`, clear attempts/error, wake worker |
 | `button_set_to_done()` | Manually mark as completed |
 | `button_set_to_failed()` | Manually mark as failed |
+| `button_cancelled()` | Manually cancel a `pending`/`waiting` job |
 | `open_related_action()` | Open the target record(s) in Odoo |
 
 ### `base` Model Extensions
@@ -200,7 +213,8 @@ from odoo.addons.job_worker.job import (
 |---|---|
 | `delay()` | Enqueue the captured method call, return `queue.job` record |
 | `split(size, chain=False)` | Split recordset into chunked group or chain |
-| `on_done(*delayables)` | Attach callback jobs to execute after this job completes |
+| `on_done(*delayables)` | Attach callback jobs to execute after this job completes successfully |
+| `on_error(*delayables)` | Attach callback jobs that run only if this job fails; auto-cancelled on success |
 
 ### Utility Functions
 
@@ -224,3 +238,4 @@ from odoo.addons.job_worker.job import (
 | Partial unique on `identity_key` (active states) | Deduplication enforcement |
 | `completed_at` (where not null) | Job cleanup queries |
 | `channel, completed_at` (where not null) | Channel-scoped reporting |
+| GIN on `dependency_job_ids` (where not null) | Group-barrier dependency lookups |

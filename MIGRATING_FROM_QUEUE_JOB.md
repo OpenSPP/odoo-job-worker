@@ -162,7 +162,12 @@ The string you pass as `channel` is just a tag -- there is no hierarchy.
 
 OCA `queue_job` has a `queue.job.function` model that registers which
 model/method combinations are allowed to be delayed. `job_worker` has **no
-function registry** -- any method on any model can be delayed.
+function-registry behavior** -- any method on any model can be delayed.
+
+> **Note:** `queue.job.function` (and `queue.job.channel`) still exist in
+> `job_worker`, but only as passive name-lookup tables auto-populated from each
+> job's `channel`/method. They have no whitelist, no `retry_pattern`, and no
+> hierarchy, and need no configuration -- you never create records in them.
 
 ### Remove function XML data
 
@@ -194,7 +199,7 @@ The state values differ between OCA `queue_job` and `job_worker`:
 | OCA queue_job       | job_worker   | Meaning                              |
 |---------------------|--------------|--------------------------------------|
 | `wait_dependencies` | `waiting`    | Blocked on parent job (graph dep)    |
-| `pending`           | `waiting`    | Same as above in some OCA contexts   |
+| `pending`           | `pending`    | Created and ready (not blocked)      |
 | `enqueued`          | `pending`    | Ready to be picked up by a worker    |
 | `started`           | `started`    | Currently executing                  |
 | `done`              | `done`       | Completed successfully               |
@@ -293,6 +298,11 @@ main.delay()
 **Implementation note:** In `job_worker`, chain dependencies are tracked via
 `parent_id` and `graph_uuid` fields on the job record. Child jobs start in
 `waiting` state and move to `pending` when their parent completes.
+
+**Error callbacks:** `job_worker` adds `on_error(*delayables)` (on `Delayable`,
+`DelayableGroup`, and `DelayableChain`) as the failure-path sibling of
+`on_done()`. The callback starts in `waiting`, is auto-cancelled if the parent
+succeeds, and runs only if the parent fails.
 
 **Group callbacks:** `group().on_done(callback)` creates a wait-for-all
 barrier — the callback starts in `waiting` state and transitions to `pending`
@@ -452,6 +462,7 @@ in searches and reads:
 | `date_enqueued`  | `create_date`         | No             |
 | `date_started`   | `started_at`          | Yes            |
 | `date_done`      | `completed_at`        | Yes            |
+| `date_cancelled` | `cancelled_at`        | Yes            |
 | `exec_time`      | `duration`            | Yes            |
 | `eta`            | `scheduled_at`        | Yes            |
 | `retry`          | `attempts`            | Yes            |
