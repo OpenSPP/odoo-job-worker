@@ -340,6 +340,21 @@ class QueueWorker:
                     has_active = bool(self.active_job_ids)
                 if not has_active:
                     break
+                # Waiting here IS forward progress, so say so: the supervisor's
+                # stall watchdog reads last_progress, which the main loop only
+                # advances at the TOP of its cycle (see run()). This branch can
+                # hold the loop indefinitely — one long-running job, a free pool
+                # slot, and nothing else acquirable (e.g. that job's channel is
+                # at its limit) — so without this write the watchdog sees a
+                # frozen timestamp and kills a perfectly healthy worker for the
+                # crime of running a slow job. That was the preprod
+                # entitlement-compute crash-loop: concurrency=2, one job, the
+                # channel capped at 1, killed every ~2 minutes forever.
+                #
+                # This does not blunt the watchdog. A genuinely hung worker
+                # blocks INSIDE _acquire_job / update_heartbeats / select() and
+                # never reaches this line, so its last_progress still freezes.
+                self.last_progress = time.monotonic()
                 time.sleep(0.05)
                 continue
             with self._active_lock:
