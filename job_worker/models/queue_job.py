@@ -557,8 +557,6 @@ class QueueJob(models.Model):
         """
         self.env.flush_all()
         for job in self:
-            if not job.graph_uuid:
-                continue
             self.env.cr.execute(
                 """
                 UPDATE queue_job
@@ -578,12 +576,11 @@ class QueueJob(models.Model):
                         ELSE cancelled_at
                     END,
                     write_date = NOW()
-                WHERE graph_uuid = %s
-                  AND state = 'waiting'
+                WHERE state = 'waiting'
                   AND dependency_job_ids IS NOT NULL
                   AND dependency_job_ids @> (%s)::jsonb
                 """,
-                (job.graph_uuid, json.dumps([job.id])),
+                (json.dumps([job.id]),),
             )
         self.env.invalidate_all()
 
@@ -596,8 +593,6 @@ class QueueJob(models.Model):
         """
         self.env.flush_all()
         for job in self:
-            if not job.graph_uuid:
-                continue
             self.env.cr.execute(
                 """
                 UPDATE queue_job
@@ -610,12 +605,11 @@ class QueueJob(models.Model):
                         ELSE %s
                     END,
                     write_date = NOW()
-                WHERE graph_uuid = %s
-                  AND state = 'waiting'
+                WHERE state = 'waiting'
                   AND dependency_job_ids IS NOT NULL
                   AND dependency_job_ids @> (%s)::jsonb
                 """,
-                (f"Parent job {job.id} failed", job.graph_uuid, json.dumps([job.id])),
+                (f"Parent job {job.id} failed", json.dumps([job.id])),
             )
         self.env.invalidate_all()
 
