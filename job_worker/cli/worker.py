@@ -508,13 +508,20 @@ class QueueWorker:
             )
             return job_id
 
-        # Reclaiming a job still in 'started': the previous worker died or was
-        # killed mid-execution (OOM under limit_memory_hard, the stall
-        # watchdog's os._exit, a container restart) and its heartbeat went
-        # stale. That kind of death raises no in-process exception and, when
-        # the job has no per-attempt timeout, never trips _handle_timeout — so
-        # neither normal attempt-counting path ran. Count the reclaim as a
-        # failed attempt here, so a job that repeatedly kills its worker cannot
+        # Reclaiming a job still in 'started' means the previous attempt never
+        # completed. Two ways in:
+        #
+        # * the worker died or was killed mid-execution (OOM under
+        #   limit_memory_hard, the stall watchdog's os._exit, a container
+        #   restart) and its heartbeat went stale — no in-process exception, so
+        #   neither normal attempt-counting path ran; or
+        # * the job overran its per-attempt timeout, and ``_handle_timeout``
+        #   deliberately left the row 'started' rather than releasing it while
+        #   the abandoned execution thread was still running.
+        #
+        # Either way this is the single place that decides retry-vs-fail for a
+        # non-completing attempt. Count the reclaim as a failed attempt, so a
+        # job that repeatedly kills its worker (or repeatedly overruns) cannot
         # be reclaimed and re-run forever (the "restarts but never finishes"
         # loop): once it exhausts max_retries, fail it with a diagnostic
         # instead of running it again.
@@ -524,17 +531,24 @@ class QueueWorker:
         # max_retries == 0 means "retry infinitely" (matches _handle_timeout).
         if max_retries and attempts > max_retries:
             reason = (
-                "WorkerDiedJobError: reclaimed after the worker died or was "
-                "killed mid-execution without completing (no exception, no "
-                "timeout); exhausted max_retries."
+                "WorkerDiedJobError: reclaimed after an attempt failed to "
+                "complete (worker died or was killed mid-execution, or the "
+                "attempt overran its timeout); exhausted max_retries."
             )
+            # Append rather than overwrite: a timed-out attempt already stamped
+            # "TimeoutJobError: Job exceeded Ns timeout", which is the more
+            # specific diagnosis and must survive.
             cr.execute(
                 "UPDATE queue_job"
-                " SET state = 'failed', attempts = %s, exc_info = %s,"
+                " SET state = 'failed', attempts = %s,"
+                " exc_info = CASE"
+                "     WHEN exc_info IS NULL OR exc_info = '' THEN %s"
+                "     ELSE exc_info || E'\\n' || %s"
+                " END,"
                 " completed_at = NOW(), worker_id = NULL, heartbeat = NULL,"
                 " write_date = NOW()"
                 " WHERE id = %s",
-                (attempts, reason, job_id),
+                (attempts, reason, reason, job_id),
             )
             # Cascade the failure so dependents don't hang in 'waiting' forever
             # (mirrors handle_exception's _cascade_failure_to_dependents, but in
@@ -564,8 +578,9 @@ class QueueWorker:
                 (cascade_reason, json.dumps([job_id])),
             )
             _logger.error(
-                "Job %s exhausted max_retries (%s) after repeated worker "
-                "deaths; marking failed instead of reclaiming.",
+                "Job %s exhausted max_retries (%s) after repeated attempts "
+                "that never completed (worker death or timeout overrun); "
+                "marking failed instead of reclaiming.",
                 job_id,
                 attempts,
             )
@@ -636,107 +651,82 @@ class QueueWorker:
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def _handle_timeout(self, job_id, timeout):
-        """Mark a timed-out job for retry or permanent failure.
+        """Record that a job overran its timeout, WITHOUT releasing the row.
+
+        A blocked Python thread cannot be force-killed, so when the timeout
+        fires the execution thread is still running the job's method. This
+        used to release the row here — ``state = 'pending'``, ``worker_id`` and
+        ``heartbeat`` cleared, ``scheduled_at`` one backoff away — which made
+        the job re-dispatchable within ~10s while that thread kept running, so
+        a second worker executed the same method concurrently.
+
+        The "results are discarded" guarantee in ``execute_job``'s timeout
+        branch does not cover that: the rollback there only discards the
+        abandoned thread's *own* cursor. A long job that commits internally —
+        precisely the kind that overruns a timeout — has already persisted
+        most of its work and goes on committing after the second attempt has
+        started.
+
+        So the row is left ``started`` with its last heartbeat intact and only
+        the reason is stamped. Re-dispatch then happens through exactly one of:
+
+        * ``_clear_worker_ownership``, when the abandoned thread finally
+          returns — the fast path, safe because the thread is provably done; or
+        * stale-job reclaim, once the heartbeat ages past
+          ``stale_after_seconds`` — the backstop for a thread that never
+          returns.
+
+        Both routes already count the attempt and cascade to dependents on
+        exhaustion, so retry accounting keeps a single writer instead of being
+        split between here and the reclaim path.
 
         Uses raw SQL (not ORM) for speed — this runs in the heartbeat
         thread and must complete before the execution thread's join
         timeout expires.
         """
         with read_committed_cursor(self.db) as cr:
+            # Guarded on 'started': if the row has already moved on (finished,
+            # or reclaimed by another worker), this attempt owns nothing and
+            # must not stamp someone else's failure reason.
             cr.execute(
-                "SELECT state, attempts, max_retries, started_at"
-                " FROM queue_job WHERE id = %s",
-                (job_id,),
+                "UPDATE queue_job SET exc_info = %s"
+                " WHERE id = %s AND state = 'started' AND worker_id = %s",
+                (
+                    f"TimeoutJobError: Job exceeded {timeout}s timeout",
+                    job_id,
+                    self.worker_uuid,
+                ),
             )
-            row = cr.fetchone()
-            if not row or row[0] != "started":
-                return
-            _state, attempts, max_retries, started_at = row
-            attempts += 1
-            exc_info = f"TimeoutJobError: Job exceeded {timeout}s timeout"
-
-            retry_infinitely = max_retries == 0
-            retry_remaining = max_retries and attempts <= max_retries
-            if retry_infinitely or retry_remaining:
-                delay_seconds = min(
-                    10 * (2 ** max(attempts - 1, 0)),
-                    self.max_backoff_seconds,
-                )
-                scheduled_at = fields.Datetime.now() + datetime.timedelta(
-                    seconds=delay_seconds
-                )
-                cr.execute(
-                    "UPDATE queue_job"
-                    " SET state = 'pending', attempts = %s, exc_info = %s,"
-                    " scheduled_at = %s, worker_id = NULL, heartbeat = NULL,"
-                    " write_date = NOW()"
-                    " WHERE id = %s",
-                    (attempts, exc_info, scheduled_at, job_id),
-                )
-                _logger.warning(
-                    "Job %s timed out (attempt %s/%s). Retrying in %ds.",
-                    job_id,
-                    attempts,
-                    max_retries,
-                    delay_seconds,
-                )
-            else:
-                now = fields.Datetime.now()
-                duration = None
-                if started_at:
-                    duration = max(0.0, (now - started_at).total_seconds())
-                cr.execute(
-                    "UPDATE queue_job"
-                    " SET state = 'failed', attempts = %s, exc_info = %s,"
-                    " completed_at = %s, duration = %s,"
-                    " scheduled_at = NULL, worker_id = NULL, heartbeat = NULL,"
-                    " write_date = NOW()"
-                    " WHERE id = %s",
-                    (attempts, exc_info, now, duration, job_id),
-                )
-                # Cascade failure to waiting children
-                cr.execute(
-                    "UPDATE queue_job"
-                    " SET state = CASE WHEN run_on_failure"
-                    "                  THEN 'pending' ELSE 'failed' END,"
-                    "     exc_info = CASE WHEN run_on_failure"
-                    "                     THEN exc_info ELSE %s END,"
-                    "     write_date = NOW()"
-                    " WHERE parent_id = %s AND state = 'waiting'",
-                    (f"Parent job {job_id} failed (timeout)", job_id),
-                )
-                # Cascade failure to multi-parent dependents (group barriers)
-                cr.execute(
-                    """
-                    UPDATE queue_job
-                    SET state = CASE WHEN run_on_failure
-                                     THEN 'pending' ELSE 'failed' END,
-                        exc_info = CASE WHEN run_on_failure
-                                        THEN exc_info ELSE %s END,
-                        write_date = NOW()
-                    WHERE state = 'waiting'
-                      AND dependency_job_ids IS NOT NULL
-                      AND dependency_job_ids @> (%s)::jsonb
-                    """,
-                    (
-                        f"Parent job {job_id} failed (timeout)",
-                        json.dumps([job_id]),
-                    ),
-                )
-                _logger.error(
-                    "Job %s timed out permanently after %s attempts.",
-                    job_id,
-                    attempts,
-                )
             cr.commit()
+        # The caller already logged the overrun at WARNING; this explains where
+        # the job goes next, so an operator seeing a still-'started' row after a
+        # timeout knows it is held deliberately rather than lost.
+        _logger.info(
+            "Job %s left started after timeout; it becomes eligible again when "
+            "the abandoned thread returns or its heartbeat goes stale (%ss).",
+            job_id,
+            self.stale_after_seconds,
+        )
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def _clear_worker_ownership(self, job_id):
-        """Clear worker_id and heartbeat for stale job recovery."""
+        """Release *our own* claim on a job so stale recovery can pick it up.
+
+        Scoped to ``worker_id = self.worker_uuid`` (same guard as the batch
+        heartbeat update). An abandoned post-timeout thread can return long
+        after its heartbeat went stale and the job was reclaimed by another
+        worker; clearing unconditionally would then null the *new* owner's
+        ``worker_id``/``heartbeat``, and since the acquire query treats a
+        ``started`` row with a NULL heartbeat as immediately reclaimable, a
+        third worker would start the job while the second was still running
+        it — reintroducing the concurrent double-execution this timeout path
+        is meant to prevent.
+        """
         with read_committed_cursor(self.db) as cr:
             cr.execute(
-                "UPDATE queue_job SET worker_id = NULL, heartbeat = NULL WHERE id = %s",
-                (job_id,),
+                "UPDATE queue_job SET worker_id = NULL, heartbeat = NULL"
+                " WHERE id = %s AND worker_id = %s",
+                (job_id, self.worker_uuid),
             )
             cr.commit()
 
