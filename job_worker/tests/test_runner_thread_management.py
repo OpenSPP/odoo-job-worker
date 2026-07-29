@@ -280,3 +280,84 @@ class TestWorkerProgressWatchdog(unittest.TestCase):
             runner._terminate_stalled_worker("db1", 999)
         mock_exit.assert_called_once_with(1)
         mock_shutdown.assert_called_once()
+
+    def test_terminate_stamps_inflight_jobs_as_stalled_not_oom(self):
+        """A watchdog kill must be distinguishable from an OOM kill.
+
+        Both leave the job to be reclaimed as WorkerDiedJobError with no other
+        diagnosis, yet they have opposite remedies (find the blocked query vs.
+        lower the memory ceiling). Naming the stall on the row is what stops the
+        next investigation going after limit_memory_hard for hours.
+        """
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.worker_uuid = "worker-uuid-1"
+        runner._worker_instances["db1"] = worker
+        runner._worker_threads["db1"] = self._alive_thread()
+
+        cursor = MagicMock()
+        cursor.rowcount = 2
+        conn = MagicMock()
+        conn.cursor.return_value = cursor
+
+        with (
+            patch.object(_runner.os, "_exit"),
+            patch.object(_runner.logging, "shutdown"),
+            patch.object(_runner.psycopg2, "connect", return_value=conn, create=True),
+            patch.object(
+                _runner.odoo.sql_db,
+                "connection_info_for",
+                return_value=("db1", {}),
+                create=True,
+            ),
+        ):
+            runner._terminate_stalled_worker("db1", 130)
+
+        updates = [
+            call
+            for call in cursor.execute.call_args_list
+            if "UPDATE queue_job" in call.args[0]
+        ]
+        self.assertEqual(len(updates), 1)
+        sql, params = updates[0].args
+        # Scoped to this worker's own in-flight rows.
+        self.assertIn("state = 'started'", sql)
+        self.assertIn("worker_id = %s", sql)
+        self.assertEqual(params[1], "worker-uuid-1")
+        self.assertIn("WorkerStalledError", params[0])
+        self.assertIn("NOT an OOM", params[0])
+
+    def test_terminate_still_exits_when_stamping_fails(self):
+        """Diagnostics must never keep a hung process alive.
+
+        A stalled worker often means a wedged database, so the stamp is the most
+        likely thing to fail — and it is the least important thing to succeed.
+        """
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.worker_uuid = "worker-uuid-2"
+        runner._worker_instances["db1"] = worker
+        runner._worker_threads["db1"] = self._alive_thread()
+
+        with (
+            patch.object(_runner.os, "_exit") as mock_exit,
+            patch.object(_runner.logging, "shutdown"),
+            patch.object(
+                _runner.odoo.sql_db,
+                "connection_info_for",
+                return_value=("db1", {}),
+                create=True,
+            ),
+            patch.object(
+                _runner.psycopg2,
+                "connect",
+                side_effect=OSError("db unreachable"),
+                create=True,
+            ) as mock_connect,
+        ):
+            runner._terminate_stalled_worker("db1", 130)
+
+        # The stamp really was attempted and really did fail — without this the
+        # test would pass without ever exercising the failure path.
+        mock_connect.assert_called_once()
+        mock_exit.assert_called_once_with(1)

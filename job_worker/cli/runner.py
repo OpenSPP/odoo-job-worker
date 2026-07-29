@@ -4,7 +4,7 @@ import signal
 import sys
 import threading
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 
 import psycopg2
 
@@ -365,6 +365,60 @@ class QueueJobRunner:
             if age > self.worker_stall_timeout_seconds:
                 self._terminate_stalled_worker(db_name, age)
 
+    def _stamp_stalled_jobs(self, db_name, age):
+        """Record on the in-flight rows WHY they are about to be orphaned.
+
+        Without this, the jobs this process is holding are reclaimed with
+        ``WorkerDiedJobError`` and an otherwise empty diagnosis — byte-for-byte
+        what an OOM kill leaves behind. The two have opposite remedies (lower
+        the memory ceiling / chunk size vs. find the blocked query), and on
+        preprod the ambiguity sent the investigation after ``limit_memory_hard``
+        for hours while the real cause was this watchdog. Naming the stall in
+        ``exc_info`` makes the difference readable straight off the job row.
+
+        Best-effort and strictly bounded: a stalled worker often means a wedged
+        database, so this takes its own connection with a short
+        ``statement_timeout`` and never blocks the exit it precedes.
+        """
+        worker = self._worker_instances.get(db_name)
+        if worker is None:
+            return
+        reason = (
+            f"WorkerStalledError: the worker made no progress for {age:.0f}s "
+            f"(limit {self.worker_stall_timeout_seconds}s) and the process was "
+            "terminated so the restart policy could recover it. This is NOT an "
+            "OOM kill — look for a blocked query or a wedged loop rather than "
+            "limit_memory_hard."
+        )
+        conn = None
+        try:
+            connection_info = odoo.sql_db.connection_info_for(db_name)[1]
+            conn = psycopg2.connect(**connection_info)
+            conn.autocommit = True
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("SET statement_timeout = 5000")
+                cursor.execute(
+                    "UPDATE queue_job SET exc_info = %s"
+                    " WHERE state = 'started' AND worker_id = %s",
+                    (reason, worker.worker_uuid),
+                )
+                _logger.error(
+                    "Stamped %s in-flight job(s) on %s as stalled (not OOM)",
+                    cursor.rowcount,
+                    db_name,
+                )
+        except Exception:
+            # Never let diagnostics keep a hung process alive.
+            _logger.warning(
+                "Could not stamp in-flight jobs on %s before exiting",
+                db_name,
+                exc_info=True,
+            )
+        finally:
+            if conn is not None:
+                with suppress(Exception):
+                    conn.close()
+
     def _terminate_stalled_worker(self, db_name, age):
         """Exit the process so a hung worker is recovered by the restart policy.
 
@@ -378,6 +432,7 @@ class QueueJobRunner:
             age,
             self.worker_stall_timeout_seconds,
         )
+        self._stamp_stalled_jobs(db_name, age)
         # os._exit bypasses normal interpreter shutdown, so buffered log
         # records and stdio would be lost — flush them first, or the
         # diagnostic above never reaches the logs.
