@@ -1,4 +1,3 @@
-import threading
 import time
 from contextlib import contextmanager
 from unittest.mock import patch
@@ -299,84 +298,115 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
             refreshed_partner = env["res.partner"].browse(partner.id)
             self.assertEqual(refreshed_partner.name, "Rollback Original")
 
-    def test_timed_out_job_is_not_reacquirable_while_its_thread_still_runs(self):
-        """The property the timeout hold exists for.
+    def test_timeout_does_not_release_the_row_for_re_dispatch(self):
+        """The invariant the timeout hold exists for.
 
-        A blocked Python thread cannot be killed, so when the timeout fires the
-        job's method is still executing. If the row were released then, another
-        worker would start the same method within one backoff and the two would
-        run concurrently. The "results are discarded" rollback at the end of
-        ``execute_job`` does not save us: it only covers the abandoned thread's
-        own cursor, and a long job that commits internally — the kind that
-        overruns a timeout — has already persisted its work.
+        _handle_timeout only ever runs while the execution thread is still
+        inside the job's method — a blocked Python thread cannot be killed. So
+        "does it release the row?" IS the concurrency question: releasing means
+        another worker starts the same method within one backoff while the first
+        thread keeps working (and keeps committing, if the job commits
+        internally — the rollback in execute_job's timeout branch only discards
+        the abandoned thread's own cursor).
 
-        So while the execution thread is alive the job must be invisible to
-        ``acquire_job_lock``, and only become eligible once it has returned.
+        Asserted on the row rather than through a real second thread: driving
+        execute_job on a bare thread deadlocks under the test harness, and the
+        row state is the precise invariant anyway. Against the old
+        implementation every assertion below fails — it wrote state='pending',
+        cleared worker_id/heartbeat, and set a scheduled_at backoff.
         """
         with self._external_env() as (cr, env):
             self._cleanup_pending_jobs(env)
-            partner = env["res.partner"].create({"name": "Timeout Concurrency"})
+            partner = env["res.partner"].create({"name": "Timeout Hold"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "Timeout Hold After"}],
+                kwargs={},
+                timeout=1,
+                max_retries=3,
+                channel="timeout_hold",
+            )
+            worker = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            # A fresh heartbeat is what a running worker would have left. Without
+            # it the row is 'started' with heartbeat IS NULL, which the acquire
+            # query treats as *immediately* stale-reclaimable — so omitting it
+            # would test the stale path rather than the hold.
+            heartbeat = fields.Datetime.now()
+            job.write(
+                {
+                    "state": "started",
+                    "worker_id": worker.worker_uuid,
+                    "started_at": heartbeat,
+                    "heartbeat": heartbeat,
+                }
+            )
+            cr.commit()
 
-            def very_slow_method(records, vals):
-                time.sleep(6)
-                return True
+            worker._handle_timeout(job.id, 1)
 
-            with patch.object(
-                type(env["res.partner"]),
-                "queue_very_slow_method",
-                very_slow_method,
-                create=True,
-            ):
-                job = env["queue.job"].enqueue(
-                    model_name="res.partner",
-                    method_name="queue_very_slow_method",
-                    record_ids=partner.ids,
-                    args=[{}],
-                    kwargs={},
-                    timeout=1,
-                    max_retries=3,
-                    channel="timeout_concurrency",
-                )
-                worker = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
-                job.write(
-                    {
-                        "state": "started",
-                        "worker_id": worker.worker_uuid,
-                        "started_at": fields.Datetime.now(),
-                    }
-                )
-                cr.commit()
+            env.invalidate_all()
+            held = env["queue.job"].browse(job.id)
+            self.assertEqual(held.state, "started")
+            self.assertEqual(held.worker_id, worker.worker_uuid)
+            self.assertTrue(held.heartbeat)
+            self.assertFalse(held.scheduled_at)
+            self.assertIn("timeout", (held.exc_info or "").lower())
+            # Attempt accounting stays with the reclaim path, the single writer
+            # for an attempt that never completed.
+            self.assertEqual(held.attempts, 0)
 
-                executor = threading.Thread(
-                    target=self._execute_on_own_cursor, args=(worker, job.id)
-                )
-                executor.start()
-                try:
-                    # The 1s timeout has fired by now; the method sleeps on.
-                    time.sleep(3)
-                    with self.env.registry.cursor() as probe_cr:
-                        rival = QueueWorker(
-                            probe_cr.dbname, heartbeat_interval_seconds=1
-                        )
-                        self.assertIsNone(
-                            rival.acquire_job_lock(probe_cr),
-                            "A timed-out job was handed to a second worker while "
-                            "its first execution thread was still running it.",
-                        )
-                finally:
-                    executor.join(timeout=30)
-                self.assertFalse(executor.is_alive())
+            # And while that heartbeat is fresh, no worker can take it.
+            rival = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            self.assertNotEqual(
+                rival.acquire_job_lock(cr),
+                job.id,
+                "A timed-out job was handed to a second worker while its first "
+                "execution thread was still running it.",
+            )
 
-            # Once the abandoned thread has returned it releases its claim, and
-            # only then does the job become eligible again.
-            with self.env.registry.cursor() as after_cr:
-                reclaimer = QueueWorker(after_cr.dbname, heartbeat_interval_seconds=1)
-                self.assertEqual(reclaimer.acquire_job_lock(after_cr), job.id)
+    def test_timeout_hold_is_released_once_the_abandoned_thread_returns(self):
+        """The other half: the hold must not strand the job forever.
 
-    def _execute_on_own_cursor(self, worker, job_id):
-        """Run a job on its own cursor, as a real worker thread would."""
-        with self.env.registry.cursor() as cr:
-            worker.execute_job(cr, job_id)
+        execute_job's timeout branch calls _clear_worker_ownership when the
+        method finally returns, which is what makes the row eligible again.
+        """
+        with self._external_env() as (cr, env):
+            self._cleanup_pending_jobs(env)
+            partner = env["res.partner"].create({"name": "Timeout Hold Release"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "Timeout Hold Release After"}],
+                kwargs={},
+                timeout=1,
+                max_retries=3,
+                channel="timeout_hold_release",
+            )
+            worker = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            heartbeat = fields.Datetime.now()
+            job.write(
+                {
+                    "state": "started",
+                    "worker_id": worker.worker_uuid,
+                    "started_at": heartbeat,
+                    "heartbeat": heartbeat,
+                }
+            )
+            cr.commit()
+            worker._handle_timeout(job.id, 1)
+
+            # The abandoned thread returns.
+            worker._clear_worker_ownership(job.id)
+
+            reclaimer = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            self.assertEqual(reclaimer.acquire_job_lock(cr), job.id)
+            env.invalidate_all()
+            reclaimed = env["queue.job"].browse(job.id)
+            self.assertEqual(reclaimed.state, "started")
+            self.assertEqual(reclaimed.attempts, 1)
 
 
 @tagged("post_install", "-at_install")
