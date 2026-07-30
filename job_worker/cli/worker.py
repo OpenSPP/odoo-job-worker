@@ -11,7 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 
-from psycopg2 import OperationalError
+from psycopg2 import DatabaseError, OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_READ_COMMITTED
 
 import odoo
@@ -269,6 +269,28 @@ class QueueWorker:
                         while conn.notifies:
                             notify = conn.notifies.pop(0)
                             _logger.debug("Received notification: %s", notify.channel)
+        except DatabaseError:
+            # A job-level database error must not kill the worker.
+            #
+            # Preprod 2026-07-30: a duplicate-key UniqueViolation aborted the
+            # transaction, and a later env.ref() on that same poisoned cursor
+            # raised InFailedSqlTransaction. That is an InternalError, not an
+            # OperationalError, so the acquire loop's handler did not catch it;
+            # it reached this method, which had only a `finally`, and the thread
+            # function returned. The supervisor restarted it, the restart
+            # re-entered registry load, hit the poisoned cursor again, and after
+            # five deaths in 300s the DATABASE WAS QUARANTINED -- every job on
+            # that database stopped, with 47 chunks left to run.
+            #
+            # One bad row must fail its job, never the worker and never the
+            # database. Log and return: the supervisor restarts this thread on a
+            # fresh cursor, which is the recovery that was already intended --
+            # the missing `except` is what turned it into a crash loop.
+            _logger.exception(
+                "Worker for %s hit a database error outside job execution; "
+                "restarting the loop rather than killing the thread",
+                self.db_name,
+            )
         finally:
             self._pool.shutdown(wait=True, cancel_futures=True)
 

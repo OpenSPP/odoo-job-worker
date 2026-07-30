@@ -118,3 +118,55 @@ class TestWorkerDbTimeouts(TransactionCase):
         with patch.object(worker, "_acquire_job", side_effect=_OtherError()):
             with self.assertRaises(OperationalError):
                 worker.process_jobs()
+
+
+@tagged("post_install", "-at_install")
+class TestWorkerSurvivesJobLevelDbErrors(TransactionCase):
+    """``run()`` must not let a database error kill the worker thread.
+
+    Regression for the preprod incident of 2026-07-30. A duplicate-key
+    ``UniqueViolation`` aborted the transaction; a later ``env.ref()`` on that
+    same poisoned cursor raised ``InFailedSqlTransaction``. That is an
+    ``InternalError``, not an ``OperationalError``, so the acquire loop's
+    handler did not catch it — it reached ``run()``, which had only a
+    ``finally``, and the thread function returned.
+
+    The supervisor restarted the thread, the restart re-entered registry load,
+    hit the poisoned cursor again, and after five deaths in 300s the **database
+    was quarantined**: every job on it stopped, with 47 chunks still to run.
+
+    One bad row must fail its job — never the worker, and never the database.
+    """
+
+    def test_database_error_does_not_kill_the_thread(self):
+        from psycopg2.errors import InFailedSqlTransaction
+
+        from ..cli.worker import QueueWorker
+
+        worker = QueueWorker(self.env.cr.dbname)
+        # Fail at the first thing run() does with the cursor, which is the
+        # cheapest faithful stand-in for "the transaction is already aborted".
+        with patch.object(
+            type(worker.db),
+            "cursor",
+            side_effect=InFailedSqlTransaction("current transaction is aborted"),
+        ):
+            # Must RETURN, not raise. A raise here is the thread dying, which is
+            # what quarantined the database in production.
+            worker.run()
+
+    def test_operational_error_still_does_not_kill_the_thread(self):
+        """The pre-existing transient-error path must keep working.
+
+        ``OperationalError`` is a ``DatabaseError`` subclass, so widening the
+        guard must not have narrowed this case.
+        """
+        from ..cli.worker import QueueWorker
+
+        worker = QueueWorker(self.env.cr.dbname)
+        with patch.object(
+            type(worker.db),
+            "cursor",
+            side_effect=OperationalError("connection lost"),
+        ):
+            worker.run()
