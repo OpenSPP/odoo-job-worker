@@ -102,10 +102,14 @@ class TestWorkerSafety(TransactionCase):
                 stale_after_seconds=1,
                 heartbeat_interval_seconds=1,
             )
-            # Seed the heartbeat deliberately STALE. If the loop never refreshed
-            # it, worker_b below WOULD acquire the job — which is what keeps this
-            # test honest. Seeding it fresh instead would let the seed alone
-            # satisfy the assertion, and the loop could stop working unnoticed.
+            # Seed the heartbeat deliberately STALE, so the final assertion is
+            # only satisfiable by a heartbeat the loop actually wrote: if the
+            # loop never refreshed it, worker_b below WOULD acquire the job.
+            #
+            # A dead loop is already caught by the _wait_for_heartbeat_after
+            # assertion below, even from a fresh seed — so this is not what
+            # detects that. It keeps the *final* probe independently honest,
+            # rather than resting on the poll having passed.
             stale_heartbeat = fields.Datetime.now() - timedelta(seconds=120)
             job.write(
                 {
