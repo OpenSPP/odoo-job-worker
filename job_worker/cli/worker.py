@@ -503,13 +503,21 @@ class QueueWorker:
             cascade_reason = f"Parent job {job_id} failed (worker died)"
             cr.execute(
                 "UPDATE queue_job"
-                " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                " SET state = CASE WHEN run_on_failure"
+                "                  THEN 'pending' ELSE 'failed' END,"
+                "     exc_info = CASE WHEN run_on_failure"
+                "                     THEN exc_info ELSE %s END,"
+                "     write_date = NOW()"
                 " WHERE parent_id = %s AND state = 'waiting'",
                 (cascade_reason, job_id),
             )
             cr.execute(
                 "UPDATE queue_job"
-                " SET state = 'failed', exc_info = %s, write_date = NOW()"
+                " SET state = CASE WHEN run_on_failure"
+                "                  THEN 'pending' ELSE 'failed' END,"
+                "     exc_info = CASE WHEN run_on_failure"
+                "                     THEN exc_info ELSE %s END,"
+                "     write_date = NOW()"
                 " WHERE state = 'waiting'"
                 " AND dependency_job_ids IS NOT NULL"
                 " AND dependency_job_ids @> (%s)::jsonb",
@@ -649,9 +657,11 @@ class QueueWorker:
                 # Cascade failure to waiting children
                 cr.execute(
                     "UPDATE queue_job"
-                    " SET state = 'failed',"
-                    " exc_info = %s,"
-                    " write_date = NOW()"
+                    " SET state = CASE WHEN run_on_failure"
+                    "                  THEN 'pending' ELSE 'failed' END,"
+                    "     exc_info = CASE WHEN run_on_failure"
+                    "                     THEN exc_info ELSE %s END,"
+                    "     write_date = NOW()"
                     " WHERE parent_id = %s AND state = 'waiting'",
                     (f"Parent job {job_id} failed (timeout)", job_id),
                 )
@@ -659,8 +669,10 @@ class QueueWorker:
                 cr.execute(
                     """
                     UPDATE queue_job
-                    SET state = 'failed',
-                        exc_info = %s,
+                    SET state = CASE WHEN run_on_failure
+                                     THEN 'pending' ELSE 'failed' END,
+                        exc_info = CASE WHEN run_on_failure
+                                        THEN exc_info ELSE %s END,
                         write_date = NOW()
                     WHERE state = 'waiting'
                       AND dependency_job_ids IS NOT NULL
@@ -872,30 +884,14 @@ class QueueWorker:
                         done_job.result = serialized_result
                     done_job.worker_id = False
                     done_job.heartbeat = False
-                    for child in done_job.child_ids.filtered(
-                        lambda c: c.state == "waiting"
-                    ):
-                        child.state = "pending"
-                    # Flush ORM writes so raw SQL sees done_job.state = "done"
-                    env_done.flush_all()
-                    # Release multi-parent dependents (group barriers)
-                    env_done.cr.execute(
-                        """
-                        UPDATE queue_job
-                        SET pending_dependency_count =
-                                pending_dependency_count - 1,
-                            state = CASE
-                                WHEN pending_dependency_count - 1 <= 0
-                                    THEN 'pending'
-                                ELSE state
-                            END,
-                            write_date = NOW()
-                        WHERE state = 'waiting'
-                          AND dependency_job_ids IS NOT NULL
-                          AND dependency_job_ids @> (%s)::jsonb
-                        """,
-                        (json.dumps([job_id]),),
-                    )
+                    # Delegate to the model so this path and the ORM one
+                    # (run_now, the Run-now button, queue_job__no_delay) cannot
+                    # drift. Both honour run_on_failure: on_done dependents are
+                    # promoted, on_error ones cancelled because no failure
+                    # occurred. _release_dependents flushes first, so the
+                    # descendant writes above are visible to its raw SQL.
+                    done_job._cascade_children_on_parent_success()
+                    done_job._release_dependents()
                     env_done.cr.execute("NOTIFY queue_job_wake_up")
                     env_done.cr.commit()
 
@@ -973,7 +969,7 @@ class QueueWorker:
             job.scheduled_at = False
             job.worker_id = False
             job.heartbeat = False
-            self._cascade_failure_to_dependents(job, f"Parent job {job.id} failed")
+            self._cascade_failure_to_dependents(job)
             _logger.error(
                 "Job %s model still missing from registry after %.0fs (> %ss cap); "
                 "failing — the model appears to be permanently removed.",
@@ -1045,29 +1041,23 @@ class QueueWorker:
             job.scheduled_at = False
             job.worker_id = False
             job.heartbeat = False
-            self._cascade_failure_to_dependents(job, f"Parent job {job.id} failed")
+            self._cascade_failure_to_dependents(job)
             _logger.error("Job %s failed permanently.\n%s", job.id, tb)
 
         job.env.cr.commit()
 
-    def _cascade_failure_to_dependents(self, job, reason):
-        """Fail this job's waiting children and group-barrier dependents.
+    def _cascade_failure_to_dependents(self, job):
+        """Cascade a permanent failure to waiting children and group barriers.
 
         Shared by the permanent-failure paths so a failed parent does not
         leave dependents stuck in 'waiting' forever.
+
+        Delegates to the model so this path and the ORM one cannot drift.
+        Both honour run_on_failure: on_done dependents cascade to 'failed',
+        while on_error ones are promoted to 'pending' so the handler that
+        exists to clean up after a failure actually runs. The model also
+        walks the chain, so grandchildren of a cascade-failed job do not stay
+        stuck in 'waiting'.
         """
-        for child in job.child_ids.filtered(lambda c: c.state == "waiting"):
-            child.state = "failed"
-            child.exc_info = reason
-        job.env.cr.execute(
-            """
-            UPDATE queue_job
-            SET state = 'failed',
-                exc_info = %s,
-                write_date = NOW()
-            WHERE state = 'waiting'
-              AND dependency_job_ids IS NOT NULL
-              AND dependency_job_ids @> (%s)::jsonb
-            """,
-            (reason, json.dumps([job.id])),
-        )
+        job._cascade_children_on_parent_failure()
+        job._fail_dependents()
