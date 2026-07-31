@@ -24,7 +24,15 @@ for MODULE in "${MODULE_ARRAY[@]}"; do
     echo "========================================"
 
     TEST_DB="test_${MODULE}_$(date +%s)"
-    if ! docker compose run --rm odoo odoo \
+    # The log is captured to a file and inspected AFTER the run, rather than piped
+    # straight into `grep -q`. With `set -o pipefail` (line 3), `grep -q` exits on
+    # its first match, closing the pipe and SIGPIPEing the still-writing producer
+    # — so the pipeline's status became that non-zero status even though the match
+    # SUCCEEDED, and a fully green run printed "FAILED". It only bites on real
+    # runs, where the log is long enough that Odoo is still writing when the match
+    # lands, which is why it survived this long: short runs look fine.
+    LOG_FILE="$(mktemp)"
+    docker compose run --rm odoo odoo \
         -d "${TEST_DB}" \
         --workers 0 \
         --test-enable \
@@ -32,12 +40,20 @@ for MODULE in "${MODULE_ARRAY[@]}"; do
         --addons-path="${ADDONS_PATH}" \
         --stop-after-init \
         -i "${MODULE}" \
-        --log-level=test 2>&1 | tee /dev/stderr | grep -q "0 failed, 0 error"; then
+        --log-level=test >"${LOG_FILE}" 2>&1 || true
+    cat "${LOG_FILE}"
+
+    # Require the summary line to be PRESENT and clean, rather than testing for
+    # the absence of a failure line: a missing summary (Odoo crashed before
+    # running tests, the image failed to build, the DB was unreachable) must count
+    # as a failure, not as "no failures found".
+    if grep -q "0 failed, 0 error" "${LOG_FILE}"; then
+        echo "PASSED: ${MODULE}"
+    else
         echo "FAILED: ${MODULE}"
         FAILED=$((FAILED + 1))
-    else
-        echo "PASSED: ${MODULE}"
     fi
+    rm -f "${LOG_FILE}"
 done
 
 echo ""
