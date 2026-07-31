@@ -351,7 +351,11 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
             self.assertEqual(held.state, "started")
             self.assertEqual(held.worker_id, worker.worker_uuid)
             self.assertTrue(held.heartbeat)
-            self.assertFalse(held.scheduled_at)
+            # Held, but PACED: the next attempt is a backoff away. This
+            # assertion used to be assertFalse(scheduled_at), which is how a
+            # missing backoff shipped past green CI — see
+            # test_timeout_paces_the_next_attempt for the property itself.
+            self.assertTrue(held.scheduled_at)
             self.assertIn("timeout", (held.exc_info or "").lower())
             # Attempt accounting stays with the reclaim path, the single writer
             # for an attempt that never completed.
@@ -365,6 +369,144 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
                 "A timed-out job was handed to a second worker while its first "
                 "execution thread was still running it.",
             )
+
+    def test_timeout_paces_the_next_attempt(self):
+        """Holding the row must not cost the retry backoff.
+
+        The hold keeps the row 'started', so nothing on the timeout path would
+        otherwise set ``scheduled_at``. A method that returns just past its
+        timeout (say 12s against a 10s limit) would then be re-run back-to-back
+        until ``max_retries`` ran out — and with ``max_retries = 0``, which means
+        retry *infinitely*, that is a perpetual zero-pacing hot loop saturating a
+        channel slot and the DB.
+
+        ``max_retries = 0`` is used here deliberately: it is the configuration
+        with no natural stopping point, so it is where the absence of a backoff
+        does unbounded damage.
+        """
+        with self._external_env() as (cr, env):
+            self._cleanup_pending_jobs(env)
+            partner = env["res.partner"].create({"name": "Timeout Pacing"})
+            job = env["queue.job"].enqueue(
+                model_name="res.partner",
+                method_name="write",
+                record_ids=partner.ids,
+                args=[{"name": "Timeout Pacing After"}],
+                kwargs={},
+                timeout=1,
+                max_retries=0,
+                channel="timeout_pacing",
+            )
+            worker = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            heartbeat = fields.Datetime.now()
+            job.write(
+                {
+                    "state": "started",
+                    "worker_id": worker.worker_uuid,
+                    "started_at": heartbeat,
+                    "heartbeat": heartbeat,
+                    "attempts": 1,
+                }
+            )
+            cr.commit()
+
+            worker._handle_timeout(job.id, 1)
+
+            env.invalidate_all()
+            held = env["queue.job"].browse(job.id)
+            self.assertTrue(
+                held.scheduled_at,
+                "a timed-out job carries no backoff; with max_retries=0 the next "
+                "attempt starts immediately, forever",
+            )
+            self.assertGreater(
+                held.scheduled_at,
+                fields.Datetime.now(),
+                f"backoff is not in the future (scheduled_at={held.scheduled_at})",
+            )
+
+            # The thread then returns, releasing the claim — the backoff must
+            # survive that, or the pacing is decorative.
+            worker._clear_worker_ownership(job.id)
+            env.invalidate_all()
+            released = env["queue.job"].browse(job.id)
+            self.assertFalse(released.worker_id)
+            self.assertTrue(
+                released.scheduled_at,
+                "_clear_worker_ownership wiped the backoff",
+            )
+
+            # Released, paced, and therefore still not acquirable right now.
+            rival = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+            self.assertNotEqual(
+                rival.acquire_job_lock(cr),
+                job.id,
+                "a job that just overran its timeout was handed out again "
+                "immediately, with no backoff",
+            )
+
+    def test_timeout_then_exception_releases_the_claim(self):
+        """The overrun-then-raise path must release the row too.
+
+        A blocked query usually ends in ``statement_timeout``, a deadlock, or a
+        serialization failure, so raising *after* the timeout fired is the common
+        terminal outcome — not the rare one. ``execute_job``'s exception handler
+        used to roll back and return without clearing ownership, leaving the row
+        'started' with a frozen heartbeat for the entire ``stale_after_seconds``
+        window even though the thread had provably returned.
+
+        The fast path is only sound because the thread has finished; that is
+        exactly the condition reaching this handler establishes.
+        """
+        with self._external_env() as (cr, env):
+            self._cleanup_pending_jobs(env)
+            partner = env["res.partner"].create({"name": "Timeout Raise"})
+
+            def slow_then_raise(records, vals):
+                time.sleep(3)
+                raise ValueError("boom after the timeout fired")
+
+            with patch.object(
+                type(env["res.partner"]),
+                "queue_slow_then_raise",
+                slow_then_raise,
+                create=True,
+            ):
+                job = env["queue.job"].enqueue(
+                    model_name="res.partner",
+                    method_name="queue_slow_then_raise",
+                    record_ids=partner.ids,
+                    args=[{}],
+                    kwargs={},
+                    timeout=1,
+                    max_retries=3,
+                    channel="timeout_raise",
+                )
+                worker = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
+                heartbeat = fields.Datetime.now()
+                job.write(
+                    {
+                        "state": "started",
+                        "worker_id": worker.worker_uuid,
+                        "started_at": heartbeat,
+                        "heartbeat": heartbeat,
+                    }
+                )
+                cr.commit()
+                worker.execute_job(cr, job.id)
+
+            env.invalidate_all()
+            after = env["queue.job"].browse(job.id)
+            self.assertFalse(
+                after.worker_id,
+                "the method raised AFTER the timeout fired — the thread has "
+                "provably returned, yet the worker's claim was not released; the "
+                "job now waits the full stale_after_seconds window",
+            )
+            self.assertFalse(after.heartbeat)
+            # The timeout reason is kept: it is the more specific diagnosis, and
+            # the raise is a consequence of the overrun, not a separate failure.
+            self.assertIn("timeout", (after.exc_info or "").lower())
 
     def test_timeout_hold_is_released_once_the_abandoned_thread_returns(self):
         """The other half: the hold must not strand the job forever.

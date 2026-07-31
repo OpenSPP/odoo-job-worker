@@ -667,11 +667,13 @@ class QueueWorker:
         most of its work and goes on committing after the second attempt has
         started.
 
-        So the row is left ``started`` with its last heartbeat intact and only
-        the reason is stamped. Re-dispatch then happens through exactly one of:
+        So the row is left ``started`` with its last heartbeat intact, and the
+        reason plus a retry backoff are stamped. Re-dispatch then happens
+        through exactly one of:
 
         * ``_clear_worker_ownership``, when the abandoned thread finally
-          returns — the fast path, safe because the thread is provably done; or
+          returns — whether it returned cleanly or raised. The fast path, safe
+          because the thread is provably done; or
         * stale-job reclaim, once the heartbeat ages past
           ``stale_after_seconds`` — the backstop for a thread that never
           returns.
@@ -679,6 +681,17 @@ class QueueWorker:
         Both routes already count the attempt and cascade to dependents on
         exhaustion, so retry accounting keeps a single writer instead of being
         split between here and the reclaim path.
+
+        **This bounds concurrent execution, it does not eliminate it.** The
+        heartbeat stops when the timeout fires (``_heartbeat_loop`` sets its own
+        stop event immediately after calling this), so a thread still blocked
+        ``stale_after_seconds`` later has its row reclaimed and the method does
+        run twice. The window goes from *guaranteed* overlap at one backoff
+        (~10s) to overlap only when the thread outlives the stale window (~60s).
+        That trade is deliberate: the alternative — keep heartbeating until the
+        thread returns — means a permanently wedged thread strands the job with
+        no recovery at all. **A job that sets ``timeout`` must therefore be
+        idempotent, or avoid committing internally.**
 
         Uses raw SQL (not ORM) for speed — this runs in the heartbeat
         thread and must complete before the execution thread's join
@@ -688,11 +701,28 @@ class QueueWorker:
             # Guarded on 'started': if the row has already moved on (finished,
             # or reclaimed by another worker), this attempt owns nothing and
             # must not stamp someone else's failure reason.
+            # ``scheduled_at`` paces the *next* attempt without releasing the
+            # row: the acquire query applies
+            # ``scheduled_at IS NULL OR scheduled_at <= NOW()`` to reclaimed
+            # ``started`` rows too, so the hold and the backoff compose. Without
+            # it a method that returns just past its timeout is re-run
+            # back-to-back, and with ``max_retries = 0`` (retry infinitely) that
+            # is a perpetual zero-pacing hot loop on a channel slot. Same curve
+            # as ``handle_exception``: 10s, 20s, 40s… capped at
+            # ``max_backoff_seconds``. ``attempts`` is already incremented for
+            # the current attempt by ``acquire_job_lock``, so ``attempts - 1``
+            # matches the ORM path's post-increment arithmetic.
             cr.execute(
-                "UPDATE queue_job SET exc_info = %s"
+                "UPDATE queue_job SET exc_info = %s,"
+                " scheduled_at = NOW() + LEAST("
+                "     10 * POWER(2, GREATEST(COALESCE(attempts, 1) - 1, 0)),"
+                "     %s"
+                " ) * INTERVAL '1 second',"
+                " write_date = NOW()"
                 " WHERE id = %s AND state = 'started' AND worker_id = %s",
                 (
                     f"TimeoutJobError: Job exceeded {timeout}s timeout",
+                    self.max_backoff_seconds,
                     job_id,
                     self.worker_uuid,
                 ),
@@ -931,9 +961,27 @@ class QueueWorker:
         except Exception as exc:
             admin_env.cr.rollback()
 
-            # If timed out, _handle_timeout already updated the state
+            # Timed out, then the method raised — the most common terminal
+            # outcome for an overrun, since a blocked query usually ends in
+            # statement_timeout, a deadlock, or a serialization failure.
+            #
+            # _handle_timeout stamped the reason and the backoff but
+            # deliberately kept the row 'started', because at that moment the
+            # execution thread was still inside the method. Reaching here proves
+            # it has returned, so this is the same fast path the clean-return
+            # branch takes: release our claim now instead of stranding the row
+            # with a frozen heartbeat for the whole stale_after_seconds window.
+            #
+            # Safe against a straggler: _clear_worker_ownership is guarded on
+            # worker_id = self.worker_uuid, so if the row was already reclaimed
+            # by another worker this updates nothing. The backoff survives —
+            # _clear_worker_ownership does not touch scheduled_at.
             if timeout_event and timeout_event.is_set():
-                _logger.info("Job %s timed out (exception path), skipping", job_id)
+                self._clear_worker_ownership(job_id)
+                _logger.info(
+                    "Job %s timed out then raised; claim released for re-dispatch",
+                    job_id,
+                )
                 return
 
             # We assume the job execution failed and we rolled back its changes.
