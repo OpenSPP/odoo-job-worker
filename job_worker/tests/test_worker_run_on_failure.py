@@ -15,9 +15,10 @@ Every test takes the ORM path (``run_now()``, the Run-now button,
 tests drive the worker.
 """
 
+import datetime
 from contextlib import contextmanager
 
-from odoo import SUPERUSER_ID, api
+from odoo import SUPERUSER_ID, api, fields
 from odoo.tests.common import TransactionCase, tagged
 
 from ..cli.worker import QueueWorker
@@ -151,8 +152,25 @@ class TestWorkerRunOnFailure(TransactionCase):
     # These run without an ORM env (heartbeat thread / acquire loop), so they
     # carry their own copy of the cascade and need covering separately.
 
-    def test_timeout_promotes_the_on_error_dependents(self):
+    def test_timeout_reclaim_promotes_the_on_error_dependents(self):
+        """A timed-out job that exhausts its retries must still run on_error.
+
+        The cascade moved. ``_handle_timeout`` no longer fails anything — it
+        leaves the row ``started`` under its owner so the still-running
+        execution thread cannot be doubled up on, and stamps only the reason.
+        The permanent-failure decision for a non-completing attempt, and
+        therefore this cascade, now belongs to the reclaim branch of
+        ``acquire_job_lock`` — the single writer for that outcome. So the test
+        drives the reclaim rather than the timeout handler: calling
+        ``_handle_timeout`` here would update zero rows (its ``worker_id``
+        guard) and assert nothing.
+        """
         with self._external_env() as (cr, env):
+            # acquire_job_lock takes the first eligible job in the whole table,
+            # so clear the field or an unrelated leftover is reclaimed instead.
+            env["queue.job"].search([("state", "in", ["pending", "started"])]).write(
+                {"state": "done", "heartbeat": False, "worker_id": False}
+            )
             parent = self._ok_job(env, "rof timeout parent", graph_uuid="g-to")
             child_err = self._ok_job(
                 env, "rof timeout child err", parent_id=parent.id, run_on_failure=True
@@ -165,12 +183,32 @@ class TestWorkerRunOnFailure(TransactionCase):
                 dependency_job_ids=[parent.id],
                 run_on_failure=True,
             )
-            # _handle_timeout only acts on a 'started' job, and permanently
-            # fails it once the retry budget is spent.
-            parent.write({"state": "started", "max_retries": 1, "attempts": 1})
+            # Stage exactly what a timed-out attempt leaves behind: held
+            # 'started' by a worker that never came back, its heartbeat frozen
+            # at the moment the timeout fired and now aged past
+            # stale_after_seconds, the timeout reason stamped, and the attempt
+            # already counted against max_retries by the acquire that started
+            # it. The next reclaim is therefore the one that exhausts retries.
+            stale_after = 60
+            parent.write(
+                {
+                    "state": "started",
+                    "max_retries": 1,
+                    "attempts": 1,
+                    "worker_id": "worker-that-never-returned",
+                    "heartbeat": fields.Datetime.now()
+                    - datetime.timedelta(seconds=stale_after * 2),
+                    "exc_info": "TimeoutJobError: Job exceeded 1s timeout",
+                }
+            )
             env.cr.commit()
 
-            QueueWorker(cr.dbname)._handle_timeout(parent.id, 1)
+            reclaimer = QueueWorker(cr.dbname, stale_after_seconds=stale_after)
+            self.assertIsNone(
+                reclaimer.acquire_job_lock(cr),
+                "A timed-out job with no retries left must be failed, not "
+                "handed out for another attempt.",
+            )
 
             for rec in (parent, child_err, child_ok, barrier_err):
                 rec.invalidate_recordset()
