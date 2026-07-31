@@ -48,11 +48,20 @@ def load_runner():
     sql_db_stub = sys.modules["odoo.sql_db"]
     odoo_stub.sql_db = sql_db_stub
 
-    # Stub psycopg2
+    # Stub psycopg2. The hierarchy matters, not just the names: the runner
+    # catches psycopg2.Error to retry a registry load in place, and
+    # OperationalError must be a subclass of it exactly as in the real driver,
+    # or a test raising OperationalError would take the wrong branch. Anything
+    # already present (the real driver, if it was imported first) is left
+    # alone.
     _ensure_stub("psycopg2")
     psycopg2_stub = sys.modules["psycopg2"]
+    if not hasattr(psycopg2_stub, "Error"):
+        psycopg2_stub.Error = type("Error", (Exception,), {})
     if not hasattr(psycopg2_stub, "OperationalError"):
-        psycopg2_stub.OperationalError = type("OperationalError", (Exception,), {})
+        psycopg2_stub.OperationalError = type(
+            "OperationalError", (psycopg2_stub.Error,), {}
+        )
 
     # Stub the worker module so ``from .worker import QueueWorker`` resolves.
     # We create a fake package structure that allows relative imports.

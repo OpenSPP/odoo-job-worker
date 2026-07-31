@@ -11,6 +11,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 
+import psycopg2
 from psycopg2 import OperationalError
 from psycopg2.extensions import ISOLATION_LEVEL_READ_COMMITTED
 
@@ -160,6 +161,8 @@ class QueueWorker:
         statement_timeout_seconds=30,
         lock_timeout_seconds=10,
         transient_registry_max_age_seconds=3600,
+        database_error_backoff_seconds=1,
+        database_error_backoff_cap_seconds=60,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -170,6 +173,16 @@ class QueueWorker:
         self.stale_after_seconds = max(1, int(stale_after_seconds))
         self.heartbeat_interval_seconds = max(1, int(heartbeat_interval_seconds))
         self.max_backoff_seconds = max(10, int(max_backoff_seconds))
+        # Backoff between attempts to re-establish the listen session after a
+        # database error. Capped well below the supervisor's degraded threshold
+        # so a wedged database is reported unhealthy rather than merely slow.
+        self.database_error_backoff_seconds = max(
+            0.05, float(database_error_backoff_seconds)
+        )
+        self.database_error_backoff_cap_seconds = max(
+            self.database_error_backoff_seconds,
+            float(database_error_backoff_cap_seconds),
+        )
         self.concurrency = max(1, int(concurrency))
         self.registry_check_interval = max(5, int(registry_check_interval))
         # How long (seconds) to keep retrying a job whose model is missing from
@@ -191,6 +204,13 @@ class QueueWorker:
         # reads this as a liveness signal: a hung loop stops advancing it even
         # though the thread stays alive (see QueueJobRunner._check_worker_progress).
         self.last_progress = time.monotonic()
+        # Consecutive database errors in the main loop, and when the streak
+        # began. A database error recovers in place instead of ending the
+        # thread, so this pair is the only remaining evidence that the worker
+        # is not serving -- the supervisor reads it via
+        # seconds_in_database_error_recovery().
+        self._database_error_streak = 0
+        self._database_error_streak_started_at = None
         self.db = odoo.sql_db.db_connect(self.db_name)
         self._pool = ThreadPoolExecutor(
             max_workers=self.concurrency,
@@ -220,57 +240,160 @@ class QueueWorker:
             _logger.warning("Registry check failed for %s", self.db_name, exc_info=True)
 
     def run(self):
-        """
-        Main Worker Loop
+        """Main worker loop. A database error recovers here, in place.
+
+        ``run`` used to be ``try`` / ``finally`` with no ``except``, so any
+        exception reaching it ended the thread function.
+
+        Preprod 2026-07-30: a duplicate-key ``UniqueViolation`` aborted a
+        transaction and a later read on that poisoned cursor raised
+        ``InFailedSqlTransaction`` — an ``InternalError``, not an
+        ``OperationalError``, so none of the ``OperationalError`` guards in
+        ``process_jobs`` / ``update_heartbeats`` / the retry wrapper caught it.
+        The thread died, the supervisor restarted it, and after five deaths in
+        300s the DATABASE WAS QUARANTINED: every job on it stopped with 47
+        chunks left to run.
+
+        Ending the thread is not a recovery, because the supervisor cannot tell
+        a deliberate exit from a crash. ``_check_thread_health`` treats *any*
+        non-alive thread as a death and calls ``_record_failure``, so returning
+        cleanly still counts toward ``maximum_consecutive_failures`` and still
+        quarantines the database — it only halves the rate, because the raise
+        path recorded two failures per death (in-thread plus the health check)
+        and a return records one.
+
+        So recover without leaving: the LISTEN session is re-established, the
+        thread stays alive, no failure is recorded, and the pool is never torn
+        down. That last point is not cosmetic — the ``finally`` below runs
+        ``cancel_futures=True``, and ``_acquire_job`` has already committed
+        those queued rows as ``started``, so tearing the pool down strands them
+        for the whole stale window and burns an attempt on reclaim. That is the
+        ``attempts`` erosion the incident report describes.
+
+        The connection itself needs no manual cleanup: Odoo's cursor
+        ``__exit__`` rolls back on an exception, ``Cursor._close`` rolls back
+        again before returning the connection to the pool, and
+        ``ConnectionPool.borrow`` calls ``reset()`` on reuse and drops closed
+        connections. A poisoned connection is therefore never handed back out
+        still poisoned.
+
+        One bad row must fail its job — never the worker, and never the
+        database.
         """
         try:
-            # Connect to DB for Listen/Notify
-            with self.db.cursor() as cr:
-                cr.execute("LISTEN queue_job_wake_up")
-                cr.commit()
-
-                _logger.info("Listening for jobs (concurrency=%d)...", self.concurrency)
-
-                while not self.stop_event.is_set():
-                    # Liveness signal for the supervisor watchdog: a hung
-                    # loop stops advancing this even though the thread lives.
-                    self.last_progress = time.monotonic()
-
-                    # 0. Check for registry changes (module install/update)
-                    self._check_registry()
-
-                    # 1. Process jobs until queue is empty or limit reached
-                    self.process_jobs()
-
-                    # 2. Update heartbeats for currently running jobs (if any).
-                    # A transient DB timeout here must not crash the loop (see
-                    # _acquire_job) — skip this cycle and retry next iteration.
-                    try:
-                        self.update_heartbeats()
-                    except OperationalError as err:
-                        if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
-                            raise
-                        _logger.warning(
-                            "Transient DB error during heartbeat update (%s); "
-                            "skipping this cycle",
-                            err.pgcode,
-                        )
-
-                    # 3. Wait for notification or timeout
-                    conn = cr._cnx
-                    if select.select([conn], [], [], self.poll_timeout) == (
-                        [],
-                        [],
-                        [],
-                    ):
-                        pass
-                    else:
-                        conn.poll()
-                        while conn.notifies:
-                            notify = conn.notifies.pop(0)
-                            _logger.debug("Received notification: %s", notify.channel)
+            while not self.stop_event.is_set():
+                try:
+                    self._listen_and_serve()
+                except psycopg2.Error:
+                    # psycopg2.Error, not DatabaseError: InterfaceError
+                    # ("connection already closed") is a sibling of
+                    # DatabaseError, not a subclass, so a dropped connection
+                    # object would otherwise still kill the thread. The
+                    # invariant is that no DB-layer trouble ends this loop.
+                    self._back_off_after_database_error()
         finally:
             self._pool.shutdown(wait=True, cancel_futures=True)
+
+    def _listen_and_serve(self):
+        """Hold one LISTEN session and serve jobs until asked to stop.
+
+        Extracted from ``run`` so that a database error can drop the session
+        and take a fresh one without unwinding the thread. Raising out of here
+        is the normal way to ask for that.
+        """
+        with self.db.cursor() as cr:
+            cr.execute("LISTEN queue_job_wake_up")
+            cr.commit()
+
+            _logger.info("Listening for jobs (concurrency=%d)...", self.concurrency)
+
+            while not self.stop_event.is_set():
+                # Liveness signal for the supervisor watchdog: a hung
+                # loop stops advancing this even though the thread lives.
+                self.last_progress = time.monotonic()
+
+                # 0. Check for registry changes (module install/update)
+                self._check_registry()
+
+                # 1. Process jobs until queue is empty or limit reached
+                self.process_jobs()
+
+                # 2. Update heartbeats for currently running jobs (if any).
+                # A transient DB timeout here must not crash the loop (see
+                # _acquire_job) — skip this cycle and retry next iteration.
+                try:
+                    self.update_heartbeats()
+                except OperationalError as err:
+                    if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
+                        raise
+                    _logger.warning(
+                        "Transient DB error during heartbeat update (%s); "
+                        "skipping this cycle",
+                        err.pgcode,
+                    )
+
+                # 3. Wait for notification or timeout
+                conn = cr._cnx
+                if select.select([conn], [], [], self.poll_timeout) == (
+                    [],
+                    [],
+                    [],
+                ):
+                    pass
+                else:
+                    conn.poll()
+                    while conn.notifies:
+                        notify = conn.notifies.pop(0)
+                        _logger.debug("Received notification: %s", notify.channel)
+
+                # A full cycle completed against a working database. Clearing
+                # the streak here rather than on entry means a database that
+                # fails midway through every cycle keeps accumulating, which is
+                # what the supervisor's degraded signal is meant to see.
+                self._database_error_streak = 0
+                self._database_error_streak_started_at = None
+
+    def _back_off_after_database_error(self):
+        """Log a database error, wait out a capped backoff, and stay alive.
+
+        The wait is on ``stop_event`` so a shutdown is not delayed by it, and
+        ``last_progress`` is advanced first: recovering IS forward progress,
+        and leaving it frozen would let the supervisor's stall watchdog kill a
+        process that is doing exactly what it should (the same reasoning as the
+        pool-full branch of ``process_jobs``).
+        """
+        self._database_error_streak += 1
+        if self._database_error_streak_started_at is None:
+            self._database_error_streak_started_at = time.monotonic()
+        delay = min(
+            self.database_error_backoff_seconds
+            * (2 ** (self._database_error_streak - 1)),
+            self.database_error_backoff_cap_seconds,
+        )
+        _logger.exception(
+            "Worker for %s hit a database error outside job execution "
+            "(consecutive: %s); re-establishing the listen session in %.1fs. "
+            "The thread stays alive, so this is not counted as a worker death.",
+            self.db_name,
+            self._database_error_streak,
+            delay,
+        )
+        self.last_progress = time.monotonic()
+        self.stop_event.wait(delay)
+
+    def seconds_in_database_error_recovery(self):
+        """How long this worker has been unable to complete a cycle, in seconds.
+
+        ``0.0`` when the last cycle was healthy. The supervisor reads this as a
+        degraded signal: now that a database error no longer kills the thread,
+        neither the quarantine set nor ``_failure_timestamps`` can see a
+        permanently wedged database, and without this the container would keep
+        reporting healthy while running no jobs at all.
+        """
+        started = self._database_error_streak_started_at
+        if started is None:
+            return 0.0
+        return max(0.0, time.monotonic() - started)
 
     @retry_on_serialization_failure(max_retries=3, base_delay=0.1)
     def update_heartbeats(self):
@@ -320,11 +443,16 @@ class QueueWorker:
             except OperationalError as err:
                 # A transient DB spike (a concurrency failure surviving the
                 # retry wrapper, or the control-plane statement/lock timeout)
-                # must not crash the thread: that forces a supervisor restart +
-                # Odoo registry reload, which under the very load that caused
-                # the timeout snowballs into a registry-reload storm. Back off
-                # and retry on the next loop instead; non-transient errors
-                # still propagate so the runner restarts the worker.
+                # is handled right here, without dropping the listen session:
+                # re-establishing it costs a round trip and, under the very
+                # load that caused the timeout, doing so on every spike is
+                # wasteful. Back off and retry on the next loop instead.
+                #
+                # A non-transient error still propagates, but no longer to end
+                # the thread -- since this PR, run() catches it, drops the
+                # session and takes a fresh one in place. The distinction that
+                # remains is how far the recovery unwinds, not whether the
+                # worker survives; it always does.
                 if err.pgcode not in PG_TRANSIENT_CONTROL_PLANE_ERRORS:
                     raise
                 _logger.warning(

@@ -181,7 +181,10 @@ class TestRunnerLifecycle(unittest.TestCase):
         mock_registry = mock_registry_class.return_value
         mock_worker_class = MagicMock()
         mock_worker_instance = mock_worker_class.return_value
-        composite = MagicMock()
+        # A real Event, not a MagicMock: the registry load is now a retry loop
+        # guarded by `while not stop_event.is_set()`, and a MagicMock's is_set()
+        # returns a truthy mock, so the loop would exit before loading anything.
+        composite = threading.Event()
 
         with (
             patch.dict(

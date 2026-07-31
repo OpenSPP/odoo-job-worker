@@ -2,6 +2,7 @@ import importlib.util
 import os
 import threading
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -416,3 +417,219 @@ class TestWorkerProgressWatchdog(unittest.TestCase):
         # test would pass without ever exercising the failure path.
         mock_connect.assert_called_once()
         mock_exit.assert_called_once_with(1)
+
+
+class TestDatabaseErrorsNeverQuarantineTheDatabase(unittest.TestCase):
+    """The incident's actual claim: a database error must not stop the database.
+
+    Preprod 2026-07-30. `InFailedSqlTransaction` escaped every
+    `OperationalError` guard, the worker thread ended, the supervisor restarted
+    it, and after five deaths in 300s the whole database was quarantined — 47
+    chunks stopped dead.
+
+    The worker-side tests prove `run()` survives. These prove the thing that
+    actually mattered, which is one level up: no failure is recorded, so the
+    quarantine never arms. They are also why "return cleanly instead of
+    raising" was not a fix — `_check_thread_health` cannot tell the difference,
+    as the first test here shows.
+    """
+
+    def _make_runner(self, **kwargs):
+        defaults = dict(
+            database_names=[],
+            use_advisory_lock=False,
+            maximum_consecutive_failures=5,
+            failure_window_seconds=300,
+            registry_load_backoff_seconds=0.01,
+            registry_load_backoff_cap_seconds=0.01,
+        )
+        defaults.update(kwargs)
+        return QueueJobRunner(**defaults)
+
+    def test_a_thread_that_keeps_ending_still_quarantines(self):
+        """Why ending the thread cannot be the recovery.
+
+        `_check_thread_health` treats *any* non-alive thread as a death: a
+        clean `return` from `run()` is indistinguishable from a raise. This
+        pins the mechanism the fix has to avoid rather than merely slow down.
+        """
+        runner = self._make_runner()
+        with patch.object(threading.Thread, "start"):
+            for _ in range(runner.maximum_consecutive_failures):
+                dead = MagicMock()
+                dead.is_alive.return_value = False
+                runner._worker_threads["db1"] = dead
+                runner._per_database_stop_events["db1"] = threading.Event()
+                runner._check_thread_health()
+        self.assertIn("db1", runner._quarantined_databases)
+
+    def test_a_worker_recovering_in_place_is_never_recorded_as_a_death(self):
+        """The fix, from the supervisor's side.
+
+        The worker keeps its thread alive across database errors, so the health
+        check sees nothing to restart, records no failure, and never arms the
+        quarantine — however long the database stays broken.
+        """
+        runner = self._make_runner()
+        alive = MagicMock()
+        alive.is_alive.return_value = True
+        runner._worker_threads["db1"] = alive
+        runner._per_database_stop_events["db1"] = threading.Event()
+
+        with patch.object(runner, "_start_worker_thread") as start:
+            for _ in range(runner.maximum_consecutive_failures * 2):
+                runner._check_thread_health()
+
+        start.assert_not_called()
+        self.assertEqual(runner._failure_timestamps, {})
+        self.assertNotIn("db1", runner._quarantined_databases)
+
+    def test_registry_load_retries_a_database_error_without_counting_a_death(self):
+        """The half the incident actually went through.
+
+        Its repeated crashes were raised from `env.ref()` during registry load,
+        which runs before `worker.run()` is ever called — so no guard inside
+        `run()` can see them. They landed in `_worker_thread_target`'s
+        `except Exception`, which records a failure; five of those quarantined
+        the database.
+        """
+        runner = self._make_runner()
+        stop_event = threading.Event()
+        attempts = []
+
+        class _Registry:
+            def __init__(self, db_name):
+                attempts.append(db_name)
+                if len(attempts) < 3:
+                    raise _runner.psycopg2.Error("current transaction is aborted")
+
+            def check_signaling(self):
+                return None
+
+        with patch.dict(
+            "sys.modules",
+            {"odoo.orm.registry": types.SimpleNamespace(Registry=_Registry)},
+        ):
+            loaded = runner._load_registry("db1", stop_event)
+
+        self.assertTrue(loaded)
+        self.assertEqual(len(attempts), 3)
+        # The two failures were retried in place, not counted toward quarantine.
+        self.assertEqual(runner._failure_timestamps, {})
+        self.assertNotIn("db1", runner._quarantined_databases)
+        # And the retry state is cleared once it succeeds, so a later health
+        # check does not read it as still-degraded.
+        self.assertNotIn("db1", runner._registry_load_retry_since)
+
+    def test_registry_load_stops_promptly_when_asked(self):
+        """An unreachable database must not delay shutdown."""
+        runner = self._make_runner()
+        stop_event = threading.Event()
+        attempts = []
+
+        class _Registry:
+            def __init__(self, db_name):
+                attempts.append(db_name)
+                stop_event.set()
+                raise _runner.psycopg2.Error("db unreachable")
+
+            def check_signaling(self):  # pragma: no cover - never reached
+                return None
+
+        with patch.dict(
+            "sys.modules",
+            {"odoo.orm.registry": types.SimpleNamespace(Registry=_Registry)},
+        ):
+            loaded = runner._load_registry("db1", stop_event)
+
+        self.assertFalse(loaded)
+        self.assertEqual(len(attempts), 1)
+
+    def test_a_non_database_registry_error_still_surfaces(self):
+        """Only *database* errors retry in place.
+
+        A genuine module import error is a real startup failure and must keep
+        propagating to the caller, which records it — retrying that forever
+        would replace a loud failure with a silent one.
+        """
+        runner = self._make_runner()
+
+        class _Registry:
+            def __init__(self, db_name):
+                raise ImportError("no module named broken_addon")
+
+            def check_signaling(self):  # pragma: no cover - never reached
+                return None
+
+        with patch.dict(
+            "sys.modules",
+            {"odoo.orm.registry": types.SimpleNamespace(Registry=_Registry)},
+        ):
+            with self.assertRaises(ImportError):
+                runner._load_registry("db1", threading.Event())
+
+
+class TestDegradedSignalSeesAnUnreachableDatabase(unittest.TestCase):
+    """A wedged database must still turn the container unhealthy.
+
+    Now that a database error records no failure, neither the quarantine set
+    nor `_failure_timestamps` can see a database that is simply unreachable.
+    Without a replacement signal the heartbeat file would keep being written
+    and the container would report healthy while running no jobs at all —
+    trading a loud crash loop for a silent dead worker.
+    """
+
+    def _make_runner(self, **kwargs):
+        defaults = dict(
+            database_names=[],
+            use_advisory_lock=False,
+            database_unhealthy_after_seconds=30,
+        )
+        defaults.update(kwargs)
+        return QueueJobRunner(**defaults)
+
+    def test_healthy_fleet_is_not_degraded(self):
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.seconds_in_database_error_recovery.return_value = 0.0
+        runner._worker_instances["db1"] = worker
+        self.assertFalse(runner._fleet_is_degraded())
+
+    def test_a_brief_recovery_is_not_degraded(self):
+        """Otherwise a single transient blip would flap the container unhealthy."""
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.seconds_in_database_error_recovery.return_value = 5.0
+        runner._worker_instances["db1"] = worker
+        self.assertFalse(runner._fleet_is_degraded())
+
+    def test_a_long_recovery_is_degraded(self):
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.seconds_in_database_error_recovery.return_value = 31.0
+        runner._worker_instances["db1"] = worker
+        self.assertTrue(runner._fleet_is_degraded())
+
+    def test_a_database_stuck_loading_its_registry_is_degraded(self):
+        """The worker instance does not exist yet, so this needs its own signal."""
+        runner = self._make_runner()
+        runner._registry_load_retry_since["db1"] = time.monotonic() - 31
+        self.assertFalse(runner._worker_instances)
+        self.assertTrue(runner._fleet_is_degraded())
+
+    def test_a_degraded_fleet_stops_writing_the_heartbeat(self):
+        """The signal is only worth anything if it reaches the healthcheck."""
+        runner = self._make_runner()
+        worker = MagicMock()
+        worker.seconds_in_database_error_recovery.return_value = 31.0
+        runner._worker_instances["db1"] = worker
+        with patch.object(_runner, "write_heartbeat") as write:
+            runner._update_heartbeat()
+        write.assert_not_called()
+
+    def test_threshold_zero_disables_the_signal(self):
+        runner = self._make_runner(database_unhealthy_after_seconds=0)
+        worker = MagicMock()
+        worker.seconds_in_database_error_recovery.return_value = 9999.0
+        runner._worker_instances["db1"] = worker
+        self.assertFalse(runner._fleet_is_degraded())
