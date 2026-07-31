@@ -150,6 +150,9 @@ class QueueJobRunner:
         worker_stall_timeout_seconds=120,
         worker_keyword_arguments=None,
         heartbeat_file=None,
+        database_unhealthy_after_seconds=300,
+        registry_load_backoff_seconds=1,
+        registry_load_backoff_cap_seconds=60,
     ):
         self.database_names = database_names
         self.discovery_interval_seconds = discovery_interval_seconds
@@ -164,6 +167,21 @@ class QueueJobRunner:
         self.worker_stall_timeout_seconds = worker_stall_timeout_seconds
         self.worker_keyword_arguments = worker_keyword_arguments or {}
         self._heartbeat_file = heartbeat_file or heartbeat_file_path()
+        # A database error no longer kills a worker thread, so neither the
+        # quarantine set nor the failure history can see a database that is
+        # persistently unreachable. A database stuck this long -- retrying its
+        # registry load, or recovering inside the main loop -- is reported
+        # degraded, which stales the heartbeat file and turns the container
+        # unhealthy. Without it, the fix below would trade a loud crash loop
+        # for a silent worker that serves nothing and looks fine.
+        self.database_unhealthy_after_seconds = database_unhealthy_after_seconds
+        self.registry_load_backoff_seconds = max(
+            0.05, float(registry_load_backoff_seconds)
+        )
+        self.registry_load_backoff_cap_seconds = max(
+            self.registry_load_backoff_seconds,
+            float(registry_load_backoff_cap_seconds),
+        )
 
         self.stop_event = threading.Event()
         self._worker_threads = {}
@@ -172,6 +190,9 @@ class QueueJobRunner:
         self._advisory_lock_connections = {}
         self._failure_timestamps = {}
         self._quarantined_databases = set()
+        # db_name -> monotonic timestamp when its registry load first failed
+        # with a database error. Cleared once the registry loads.
+        self._registry_load_retry_since = {}
 
     @classmethod
     def from_environ_or_config(cls):
@@ -526,6 +547,13 @@ class QueueJobRunner:
         ``_failure_timestamps`` survives, so checking the failure history
         keeps the signal stable for a persistently broken database instead
         of flapping healthy after each rediscovery.
+
+        Neither of those can see a database that is *unreachable* rather than
+        crashing, because a database error now recovers in place and records no
+        failure at all.  So a database that has been retrying its registry load
+        or recovering inside the main loop for longer than
+        ``database_unhealthy_after_seconds`` is degraded too — that is what
+        keeps a wedged database from looking healthy while it serves nothing.
         """
         if self._quarantined_databases:
             return True
@@ -537,6 +565,21 @@ class QueueJobRunner:
         for timestamps in list(self._failure_timestamps.values()):
             recent = sum(1 for ts in timestamps if ts >= cutoff)
             if recent >= self.maximum_consecutive_failures:
+                return True
+        threshold = self.database_unhealthy_after_seconds
+        if not threshold:
+            return False
+        now = time.monotonic()
+        # Stuck before the worker even exists (registry load), and stuck after
+        # it does (the main loop). Both are snapshotted for the same reason as
+        # above: worker threads mutate them concurrently.
+        for started in list(self._registry_load_retry_since.values()):
+            if now - started >= threshold:
+                return True
+        for worker in list(self._worker_instances.values()):
+            if worker is None:
+                continue
+            if worker.seconds_in_database_error_recovery() >= threshold:
                 return True
         return False
 
@@ -554,12 +597,8 @@ class QueueJobRunner:
         """
         try:
             _logger.info("Worker starting for database %s", db_name)
-            _logger.info("Loading registry for database %s", db_name)
-            from odoo.orm.registry import Registry
-
-            registry = Registry(db_name)
-            registry.check_signaling()
-            _logger.info("Registry loaded for database %s", db_name)
+            if not self._load_registry(db_name, composite_stop_event):
+                return
             worker = QueueWorker(
                 db_name,
                 stop_event=composite_stop_event,
@@ -575,6 +614,58 @@ class QueueJobRunner:
             self._record_failure(db_name)
         finally:
             self._worker_instances.pop(db_name, None)
+            self._registry_load_retry_since.pop(db_name, None)
+
+    def _load_registry(self, db_name, stop_event):
+        """Load the Odoo registry, retrying in place on a *database* error.
+
+        Returns True once loaded, False if asked to stop before that.
+
+        This is the other half of "a database error must never quarantine the
+        database", and it is the half the preprod incident actually went
+        through. The repeated deaths there were raised from ``env.ref()`` in a
+        module's ``ir.module.module`` menu-icon hook, reached during registry
+        load — which happens *here*, before ``worker.run()`` is ever called. No
+        guard inside ``run`` can see them: they land in this method's caller,
+        which counts a failure and, five times over, quarantines the database.
+        (``QueueWorker._check_registry`` cannot see them either — the in-loop
+        re-check swallows every exception itself.)
+
+        So a database error retries here instead of counting as a worker death.
+        Anything else — a genuine module import error, a broken model
+        definition — still propagates to the caller and is recorded, which
+        keeps the original intent that startup errors surface loudly rather
+        than being masked.
+        """
+        attempt = 0
+        while not stop_event.is_set():
+            try:
+                _logger.info("Loading registry for database %s", db_name)
+                from odoo.orm.registry import Registry
+
+                registry = Registry(db_name)
+                registry.check_signaling()
+            except psycopg2.Error:
+                attempt += 1
+                self._registry_load_retry_since.setdefault(db_name, time.monotonic())
+                delay = min(
+                    self.registry_load_backoff_seconds * (2 ** (attempt - 1)),
+                    self.registry_load_backoff_cap_seconds,
+                )
+                _logger.exception(
+                    "Registry load for %s failed with a database error "
+                    "(attempt %s); retrying in %.1fs. The thread stays alive, "
+                    "so this is not counted as a worker death.",
+                    db_name,
+                    attempt,
+                    delay,
+                )
+                stop_event.wait(delay)
+                continue
+            _logger.info("Registry loaded for database %s", db_name)
+            self._registry_load_retry_since.pop(db_name, None)
+            return True
+        return False
 
     def _setup_signal_handlers(self):
         """Install signal handlers for graceful shutdown."""
