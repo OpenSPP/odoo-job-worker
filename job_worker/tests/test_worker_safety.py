@@ -102,26 +102,64 @@ class TestWorkerSafety(TransactionCase):
                 stale_after_seconds=1,
                 heartbeat_interval_seconds=1,
             )
+            # Seed the heartbeat deliberately STALE. If the loop never refreshed
+            # it, worker_b below WOULD acquire the job — which is what keeps this
+            # test honest. Seeding it fresh instead would let the seed alone
+            # satisfy the assertion, and the loop could stop working unnoticed.
+            stale_heartbeat = fields.Datetime.now() - timedelta(seconds=120)
             job.write(
                 {
                     "state": "started",
                     "worker_id": worker_a.worker_uuid,
-                    "heartbeat": fields.Datetime.now(),
+                    "heartbeat": stale_heartbeat,
                 }
             )
             job_id = job.id
             setup_cr.commit()
 
-        worker_b = QueueWorker(self.env.cr.dbname, stale_after_seconds=1)
+        # 2s, not 1s: the margin has to exceed the gap between observing the
+        # refresh below and issuing the acquire. At 1s this test was a coin flip
+        # on loaded CI -- _heartbeat_loop does stop_event.wait(interval) BEFORE
+        # each write, so heartbeats land at t=1s, 2s, ... and the old fixed
+        # sleep(2.1) probe sat ~0.1s after a write. Any hiccup that delayed the
+        # t=2s write past the probe made the heartbeat read 1.1s old, i.e.
+        # legitimately stale, and the job was reclaimed.
+        worker_b = QueueWorker(self.env.cr.dbname, stale_after_seconds=2)
         stop_event = threading.Event()
         heartbeat_thread = threading.Thread(
             target=worker_a._heartbeat_loop, args=(job_id, stop_event), daemon=True
         )
         heartbeat_thread.start()
-        time.sleep(2.1)
-        db = odoo.sql_db.db_connect(self.env.cr.dbname)
-        with closing(db.cursor()) as cr_b:
-            acquired_b = worker_b.acquire_job_lock(cr_b)
-        stop_event.set()
-        heartbeat_thread.join(timeout=3)
+        try:
+            # Wait for the refresh to actually land rather than guessing how long
+            # it takes. This is what removes the race.
+            self.assertTrue(
+                self._wait_for_heartbeat_after(job_id, stale_heartbeat),
+                "the heartbeat loop never refreshed the heartbeat",
+            )
+            db = odoo.sql_db.db_connect(self.env.cr.dbname)
+            with closing(db.cursor()) as cr_b:
+                acquired_b = worker_b.acquire_job_lock(cr_b)
+        finally:
+            stop_event.set()
+            heartbeat_thread.join(timeout=3)
         self.assertFalse(acquired_b)
+
+    def _wait_for_heartbeat_after(self, job_id, previous, timeout=15.0):
+        """Poll until ``job_id``'s committed heartbeat is newer than *previous*.
+
+        Read on its own short-lived cursor each time: the heartbeat is written by
+        another thread on another connection, so a long-lived cursor would hold a
+        snapshot from before the write and never see it.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self.env.registry.cursor() as poll_cr:
+                poll_cr.execute(
+                    "SELECT heartbeat FROM queue_job WHERE id = %s", (job_id,)
+                )
+                row = poll_cr.fetchone()
+            if row and row[0] and row[0] > previous:
+                return True
+            time.sleep(0.05)
+        return False
