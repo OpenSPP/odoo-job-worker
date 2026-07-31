@@ -193,6 +193,17 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
             self.assertFalse(refreshed.heartbeat)
 
             # ...and it is genuinely re-acquirable, counting the attempt.
+            #
+            # The retry backoff has to be stepped over first: this job has
+            # retries left, so _handle_timeout paced the next attempt and the
+            # acquire query honours scheduled_at. That pacing is the subject of
+            # test_timeout_paces_the_next_attempt; here it is incidental, and the
+            # property under test is attempt accounting on reclaim. Clearing it
+            # is what keeps this test about one thing.
+            self.assertTrue(refreshed.scheduled_at, "the next attempt was not paced")
+            refreshed.write({"scheduled_at": False})
+            cr.commit()
+
             reclaimer = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
             self.assertEqual(reclaimer.acquire_job_lock(cr), job.id)
             env.invalidate_all()
@@ -428,6 +439,13 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
             # The thread then returns, releasing the claim — the backoff must
             # survive that, or the pacing is decorative.
             worker._clear_worker_ownership(job.id)
+            # commit(), not just invalidate_all(): _clear_worker_ownership writes
+            # on its own connection, and this cursor already has an open
+            # transaction from the reads above. invalidate_all() drops the ORM
+            # cache but not the DB snapshot, so under REPEATABLE READ the re-read
+            # would return the pre-release row and this assertion would fail
+            # against correct code.
+            cr.commit()
             env.invalidate_all()
             released = env["queue.job"].browse(job.id)
             self.assertFalse(released.worker_id)
@@ -542,6 +560,17 @@ class TestTimeoutWorkerEnforcement(TransactionCase):
 
             # The abandoned thread returns.
             worker._clear_worker_ownership(job.id)
+
+            # Step over the retry backoff _handle_timeout stamped: this job has
+            # retries left, so its next attempt is paced. The pacing itself is
+            # covered by test_timeout_paces_the_next_attempt (including that
+            # _clear_worker_ownership must NOT wipe it); this test is about the
+            # hold being released rather than about when the retry runs.
+            env.invalidate_all()
+            paced = env["queue.job"].browse(job.id)
+            self.assertTrue(paced.scheduled_at, "the next attempt was not paced")
+            paced.write({"scheduled_at": False})
+            cr.commit()
 
             reclaimer = QueueWorker(cr.dbname, heartbeat_interval_seconds=1)
             self.assertEqual(reclaimer.acquire_job_lock(cr), job.id)

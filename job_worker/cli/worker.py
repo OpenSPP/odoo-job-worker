@@ -701,7 +701,7 @@ class QueueWorker:
             # Guarded on 'started': if the row has already moved on (finished,
             # or reclaimed by another worker), this attempt owns nothing and
             # must not stamp someone else's failure reason.
-            # ``scheduled_at`` paces the *next* attempt without releasing the
+            # ``scheduled_at`` paces the *next attempt* without releasing the
             # row: the acquire query applies
             # ``scheduled_at IS NULL OR scheduled_at <= NOW()`` to reclaimed
             # ``started`` rows too, so the hold and the backoff compose. Without
@@ -712,12 +712,25 @@ class QueueWorker:
             # ``max_backoff_seconds``. ``attempts`` is already incremented for
             # the current attempt by ``acquire_job_lock``, so ``attempts - 1``
             # matches the ORM path's post-increment arithmetic.
+            #
+            # Only paced when a retry will actually happen. Pacing an *exhausted*
+            # job would defer its permanent-failure decision — and therefore the
+            # cascade to its dependents — by up to ``max_backoff_seconds``,
+            # leaving them in 'waiting' for an hour over a job that is never
+            # going to run again. The predicate mirrors the reclaim path's
+            # exhaustion rule (which fails when ``max_retries`` is set and
+            # ``attempts + 1 > max_retries``), so the two agree on what
+            # "exhausted" means.
             cr.execute(
                 "UPDATE queue_job SET exc_info = %s,"
-                " scheduled_at = NOW() + LEAST("
-                "     10 * POWER(2, GREATEST(COALESCE(attempts, 1) - 1, 0)),"
-                "     %s"
-                " ) * INTERVAL '1 second',"
+                " scheduled_at = CASE"
+                "     WHEN max_retries = 0 OR COALESCE(attempts, 1) < max_retries"
+                "     THEN NOW() + LEAST("
+                "         10 * POWER(2, GREATEST(COALESCE(attempts, 1) - 1, 0)),"
+                "         %s"
+                "     ) * INTERVAL '1 second'"
+                "     ELSE scheduled_at"
+                " END,"
                 " write_date = NOW()"
                 " WHERE id = %s AND state = 'started' AND worker_id = %s",
                 (
