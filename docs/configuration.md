@@ -16,6 +16,8 @@ The `QueueWorker` class accepts these parameters:
 | `statement_timeout_seconds` | `30` | Per-statement timeout applied to control-plane cursors |
 | `lock_timeout_seconds` | `10` | Lock-acquisition timeout applied to control-plane cursors |
 | `transient_registry_max_age_seconds` | `3600` | How long a transient registry error is retried without counting toward `max_retries` |
+| `database_error_backoff_seconds` | `1` | Initial wait after a database error in the worker's main loop; the worker recovers in place (drops the session, backs off, takes a fresh one) rather than dying |
+| `database_error_backoff_cap_seconds` | `60` | Cap for that exponential backoff. Must stay below `worker_stall_timeout_seconds`, or the stall watchdog would kill a correctly-recovering worker |
 
 ### Environment Variables
 
@@ -43,10 +45,18 @@ The `QueueJobRunner` supervises workers across multiple databases.
 |---|---|---|
 | `database_names` | (auto-discover) | List of databases to process; `None` means auto-discover |
 | `discovery_interval_seconds` | `60` | Seconds between database discovery cycles |
-| `maximum_consecutive_failures` | `5` | Failures within the window before a database is quarantined |
+| `maximum_consecutive_failures` | `5` | Worker crashes within the window before a database is quarantined. Only genuine crashes (non-database exceptions) count: database errors are recovered in place and never arm the quarantine |
 | `failure_window_seconds` | `300` | Time window used for failure counting |
 | `join_timeout_seconds` | `30` | Seconds to wait for a worker thread to stop |
-| `worker_stall_timeout_seconds` | `120` | A worker whose thread stops making progress for this long is treated as stalled and restarted |
+| `worker_stall_timeout_seconds` | `120` | A worker whose main loop stops making progress for this long is treated as stalled: its in-flight job rows are stamped with `WorkerStalledError` and the process exits for restart-policy recovery. Waiting on the worker's own still-running job counts as progress, so a single long job does not trip it |
+| `database_unhealthy_after_seconds` | `300` | A database stuck in database-error recovery (main loop or registry load) for this long counts as degraded, which withholds the runner heartbeat so the container healthcheck fails |
+| `registry_load_backoff_seconds` | `1` | Initial wait when registry load hits a database error; the load is retried in place instead of counting as a worker death |
+| `registry_load_backoff_cap_seconds` | `60` | Cap for that exponential backoff |
+
+The database-error recovery and degraded-health parameters
+(`database_error_backoff_*`, `registry_load_backoff_*`,
+`database_unhealthy_after_seconds`) are constructor-only for now — they have no
+environment-variable equivalents.
 
 The runner uses PostgreSQL advisory locks to prevent duplicate runners on the same
 databases.

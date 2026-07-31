@@ -79,6 +79,27 @@ The job list view supports bulk actions:
 - **Set to Done** — Mark selected jobs as completed
 - **Set to Failed** — Mark selected jobs as failed
 
+### Reading `exc_info` After a Worker Kill
+
+When a worker process dies mid-job, the reclaimed job's `Exception Info` says
+which kind of death it was — the remedies are opposite, so read it before acting:
+
+- **`WorkerStalledError`** — the runner's stall watchdog killed the process
+  because the worker's main loop stopped making progress. This is **not** an OOM
+  kill (the message says so explicitly): look for a blocked query or a wedged
+  loop rather than lowering `limit_memory_hard` or chunk sizes. In a multi-database
+  process, jobs on the *other* databases get a variant naming the database that
+  actually stalled — those databases were collateral, not the cause.
+- **`TimeoutJobError`** — the attempt overran its per-job `timeout`. The row is
+  deliberately held `started` until the abandoned thread returns or its heartbeat
+  goes stale; see [TimeoutJobError](reference.md#timeoutjoberror).
+- **`WorkerDiedJobError`** — the attempt never completed and the row was
+  reclaimed after its heartbeat went stale: the worker died (OOM under
+  `limit_memory_hard`, container restart) or a timed-out attempt was recovered
+  through the stale-reclaim backstop. Diagnoses are appended, not overwritten, so
+  an earlier `TimeoutJobError` or `WorkerStalledError` line above it identifies
+  the specific cause; if there is none, suspect memory or infrastructure.
+
 ### Troubleshooting
 
 If jobs are not running:

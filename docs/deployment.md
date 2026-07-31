@@ -137,8 +137,15 @@ A stale heartbeat means one of:
 - the supervisor loop has stopped iterating (hung / deadlocked), or
 - the worker fleet is degraded — the runner deliberately withholds the heartbeat
   while any database is quarantined (its worker has crashed past the failure
-  threshold), so a persistently broken database surfaces as unhealthy rather than
-  flapping after each rediscovery.
+  threshold) **or** stuck in database-error recovery for longer than
+  `database_unhealthy_after_seconds` (default 300s). Database errors no longer
+  crash worker threads or arm the quarantine — the worker recovers in place — so
+  this degraded signal is how a database that is unreachable or permanently
+  broken surfaces. It clears on its own once a full healthy cycle completes.
+
+Because the degraded signal only reaches an orchestrator through this script,
+wire `job_worker_healthcheck.py` as the container healthcheck in every
+deployment — without it a worker stuck in recovery looks healthy from outside.
 
 The script imports only the standard library (it does **not** bootstrap Odoo), so
 it is fast enough to run as a container `HEALTHCHECK`:
