@@ -21,7 +21,7 @@ Returns the created `queue.job` record.
 | `max_retries` | `int` | `5` | Maximum retry attempts (0 = infinite) |
 | `description` | `str` | `None` | Human-readable description (stored in `name` field) |
 | `identity_key` | `str` or callable | `None` | Deduplication key |
-| `timeout` | `int` | `0` | Per-job timeout in seconds (0 = no timeout) |
+| `timeout` | `int` | `0` | Per-job timeout in seconds (0 = no timeout). A timed-out attempt's thread cannot be killed, so overlap with the retry is bounded but possible — jobs that set a timeout must be idempotent or avoid committing internally. See [TimeoutJobError](reference.md#timeoutjoberror) |
 
 ## `delayable()`
 

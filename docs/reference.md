@@ -153,9 +153,24 @@ Exception class used to label timeout failures:
 from odoo.addons.job_worker.exception import TimeoutJobError
 ```
 
-On timeout, the worker updates job state internally and writes
-`TimeoutJobError: ...` into `exc_info`; timeout handling then follows the standard
-retry logic unless `max_retries` is exhausted.
+A blocked Python thread cannot be force-killed, so when a per-attempt timeout
+fires the execution thread may still be running the job's method. The worker
+therefore does **not** release the row on timeout: it stays `started` under the
+original worker's claim, with `TimeoutJobError: ...` written into `exc_info` and
+the next attempt paced by the standard exponential backoff (`scheduled_at`).
+The job becomes eligible for re-dispatch through exactly one of:
+
+- the abandoned execution thread finally returning (cleanly or by raising), which
+  releases the worker's claim immediately; or
+- the row's heartbeat aging past `stale_after_seconds` — the backstop for a
+  thread that never returns.
+
+Retry counting and the permanent-failure decision (including the cascade to
+dependents) happen at reclaim, and the reclaim **appends** to `exc_info` so the
+timeout diagnosis survives. This bounds concurrent double-execution rather than
+eliminating it: a thread still blocked after `stale_after_seconds` overlaps the
+next attempt. **A job that sets `timeout` must therefore be idempotent, or avoid
+committing internally.**
 
 ### `TransientRegistryError`
 
