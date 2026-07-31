@@ -340,6 +340,46 @@ class QueueWorker:
                     has_active = bool(self.active_job_ids)
                 if not has_active:
                     break
+                # Waiting here IS forward progress, so say so: the supervisor's
+                # stall watchdog reads last_progress, which the main loop only
+                # advances at the TOP of its cycle (see run()). This branch can
+                # hold the loop indefinitely — one long-running job, a free pool
+                # slot, and nothing else acquirable (e.g. that job's channel is
+                # at its limit) — so without this write the watchdog sees a
+                # frozen timestamp and kills a perfectly healthy worker for the
+                # crime of running a slow job. That was the preprod
+                # entitlement-compute crash-loop: concurrency=2, one job, the
+                # channel capped at 1, killed every ~2 minutes forever.
+                #
+                # The watchdog still catches a hung *worker*: a blocked
+                # _acquire_job / update_heartbeats / select() never reaches this
+                # line, so last_progress freezes and the process is killed.
+                #
+                # It no longer catches one hang mode, and that is a deliberate
+                # trade rather than an oversight. A job *method* wedged forever
+                # (job-execution cursors carry no statement_timeout by design,
+                # see read_committed_cursor) never runs the finally that empties
+                # active_job_ids, and its own heartbeat thread keeps beating — so
+                # the row is never stale-reclaimed by anyone, and after this
+                # change the watchdog no longer kills the process either. The
+                # result is a permanently leaked pool slot with nothing in any
+                # log.
+                #
+                # What that replaces was accidental, not a designed recovery: the
+                # old kill only fired when the queue happened to be empty (any
+                # other flowing job advances last_progress at the top of run())
+                # and never when *all* slots were wedged (the pool-full check
+                # breaks back to run()). So it traded one lucky configuration for
+                # fixing a false positive that killed healthy workers in the
+                # DEFAULT configuration — COALESCE(l."limit", 1) means limit-1
+                # applies to any channel with no queue_limit row.
+                #
+                # Real execution-thread liveness (a per-slot deadline the
+                # watchdog can see, or a default per-job timeout) is the actual
+                # fix and is tracked separately. Note the leaked slot survives
+                # the timeout-hold work too: there the *job* recovers once its
+                # heartbeat loop stops, but active_job_ids still never empties.
+                self.last_progress = time.monotonic()
                 time.sleep(0.05)
                 continue
             with self._active_lock:
