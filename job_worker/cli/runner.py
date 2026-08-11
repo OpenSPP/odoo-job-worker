@@ -264,7 +264,7 @@ class QueueJobRunner:
 
     def discover_databases(self):
         """Find databases, check for module, acquire locks, manage workers."""
-        self._quarantined_databases.clear()
+        self._expire_quarantines()
         database_names = self.database_names or _get_database_names()
         active_databases = set()
 
@@ -496,15 +496,54 @@ class QueueJobRunner:
         logging.shutdown()
         os._exit(1)
 
+    def _recent_failure_count(self, db_name):
+        """Prune failures outside the window and return how many remain.
+
+        Pruning on *read* as well as on write is what lets a quarantine
+        expire. A quarantined database records no new failures — the health
+        check skips it before reaching ``_record_failure`` — so its history
+        only ages, and nothing else would ever notice that it had.
+        """
+        timestamps = self._failure_timestamps.get(db_name)
+        if not timestamps:
+            return 0
+        cutoff = time.monotonic() - self.failure_window_seconds
+        remaining = [ts for ts in timestamps if ts >= cutoff]
+        if remaining:
+            self._failure_timestamps[db_name] = remaining
+        else:
+            self._failure_timestamps.pop(db_name, None)
+        return len(remaining)
+
+    def _expire_quarantines(self):
+        """Release databases whose failures have aged out of the window.
+
+        Runs once per discovery pass, in place of the unconditional
+        ``_quarantined_databases.clear()`` this replaces. That clear looked
+        like it granted a quarantined database another chance, but it did the
+        opposite: with the set emptied, ``_check_thread_health`` re-counted
+        the *same* dead thread on the next tick and re-armed the quarantine.
+        One corpse recounted once per pass keeps the window permanently full,
+        so the pruning meant to release the database could never drain and it
+        was retried exactly zero times — a five-hour queue stall on dev
+        payroll, 2026-08-11 (#30), long after the fault behind it had cleared.
+
+        Expiring on the pruned history instead bounds a quarantine to roughly
+        one ``failure_window_seconds`` past the last genuine death.
+        """
+        for db_name in sorted(self._quarantined_databases):
+            if self._recent_failure_count(db_name) >= self.maximum_consecutive_failures:
+                continue
+            self._quarantined_databases.discard(db_name)
+            _logger.info(
+                "Quarantine expired for database %s; it will be retried",
+                db_name,
+            )
+
     def _record_failure(self, db_name):
         """Track a failure timestamp and quarantine if threshold exceeded."""
-        now = time.monotonic()
-        timestamps = self._failure_timestamps.setdefault(db_name, [])
-        timestamps.append(now)
-        # Prune old timestamps outside the failure window
-        cutoff = now - self.failure_window_seconds
-        self._failure_timestamps[db_name] = [ts for ts in timestamps if ts >= cutoff]
-        if len(self._failure_timestamps[db_name]) >= self.maximum_consecutive_failures:
+        self._failure_timestamps.setdefault(db_name, []).append(time.monotonic())
+        if self._recent_failure_count(db_name) >= self.maximum_consecutive_failures:
             _logger.error(
                 "Database %s quarantined after %d failures in %ds",
                 db_name,

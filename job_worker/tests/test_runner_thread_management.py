@@ -633,3 +633,135 @@ class TestDegradedSignalSeesAnUnreachableDatabase(unittest.TestCase):
         worker.seconds_in_database_error_recovery.return_value = 9999.0
         runner._worker_instances["db1"] = worker
         self.assertFalse(runner._fleet_is_degraded())
+
+
+class _FakeClock:
+    """A monotonic clock the test advances by hand.
+
+    ``QueueJobRunner`` reads only ``time.monotonic``, so substituting this for
+    the module's ``time`` reference lets a test cover minutes of supervisor
+    loop without sleeping — and without the timing flakiness that a real clock
+    would bring to a window/interval resonance test.
+    """
+
+    def __init__(self, start=1000.0):
+        self._now = start
+
+    def monotonic(self):
+        return self._now
+
+    def advance(self, seconds):
+        self._now += seconds
+
+
+class TestQuarantineExpires(unittest.TestCase):
+    """A quarantine must not outlive the fault that caused it.
+
+    Dev payroll, 2026-08-11 (#30). Five registry-load crashes in 30 seconds
+    quarantined the database; the supervisor then logged the same quarantine
+    line once a minute for five hours and never retried, while 25 jobs sat
+    `pending`. The data fault behind the crashes had cleared within the hour.
+
+    The mechanism is a resonance between three settings that are independent
+    everywhere else: `_check_thread_health` runs every ~10s, discovery clears
+    the quarantine every `discovery_interval_seconds` (60s), and
+    `failure_window_seconds` (300s) is exactly `maximum_consecutive_failures`
+    (5) discovery passes wide. So one corpse, re-counted once per pass, keeps
+    the window permanently full and the pruning that was meant to release the
+    database can never drain.
+    """
+
+    def _make_runner(self, **kwargs):
+        defaults = dict(
+            database_names=["db1"],
+            use_advisory_lock=False,
+            maximum_consecutive_failures=5,
+            failure_window_seconds=300,
+        )
+        defaults.update(kwargs)
+        return QueueJobRunner(**defaults)
+
+    def _quarantined_runner(self):
+        runner = self._make_runner()
+        dead = MagicMock()
+        dead.is_alive.return_value = False
+        runner._worker_threads["db1"] = dead
+        runner._per_database_stop_events["db1"] = threading.Event()
+        for _ in range(runner.maximum_consecutive_failures):
+            runner._record_failure("db1")
+        self.assertIn("db1", runner._quarantined_databases)
+        return runner
+
+    def test_one_dead_thread_is_not_recounted_on_every_discovery_pass(self):
+        """The bug itself: a corpse already counted must not count again.
+
+        Each pass re-counting the same non-alive thread is what refills the
+        window. Nothing about the database got worse between these passes.
+        """
+        runner = self._quarantined_runner()
+        recorded = len(runner._failure_timestamps["db1"])
+
+        with (
+            patch.object(_runner, "_database_has_module", return_value=True),
+            patch.object(runner, "_start_worker_thread") as start,
+        ):
+            for _ in range(5):
+                runner.discover_databases()
+                runner._check_thread_health()
+
+        self.assertEqual(len(runner._failure_timestamps["db1"]), recorded)
+        start.assert_not_called()
+
+    def test_a_quarantined_database_is_retried_once_its_failures_age_out(self):
+        """The consequence: the database must get another chance.
+
+        Ten simulated minutes at the real 60s discovery cadence — well past
+        the 300s window — with no new deaths in between. Without expiry this
+        never restarts, however long it runs, which is the outage.
+        """
+        clock = _FakeClock()
+        runner = self._make_runner()
+        dead = MagicMock()
+        dead.is_alive.return_value = False
+        runner._worker_threads["db1"] = dead
+        runner._per_database_stop_events["db1"] = threading.Event()
+
+        with (
+            patch.object(_runner, "time", clock),
+            patch.object(_runner, "_database_has_module", return_value=True),
+            patch.object(runner, "_start_worker_thread") as start,
+        ):
+            # Arm the quarantine on the fake clock, so its timestamps sit on
+            # the same timeline the pruning below compares against.
+            for _ in range(runner.maximum_consecutive_failures):
+                runner._record_failure("db1")
+            self.assertIn("db1", runner._quarantined_databases)
+
+            for _ in range(10):
+                clock.advance(60)
+                runner.discover_databases()
+                runner._check_thread_health()
+
+        self.assertTrue(
+            start.called,
+            "a quarantined database was never retried after its failure window elapsed",
+        )
+
+    def test_a_still_failing_database_stays_quarantined(self):
+        """Expiry must not become "retry forever, immediately".
+
+        A database that keeps killing its worker has to settle back into
+        quarantine rather than spin. This is the property that stops the fix
+        from trading a stuck queue for a crash loop.
+        """
+        runner = self._quarantined_runner()
+
+        with (
+            patch.object(_runner, "_database_has_module", return_value=True),
+            patch.object(threading.Thread, "start"),
+        ):
+            for _ in range(3):
+                runner.discover_databases()
+                runner._check_thread_health()
+
+        self.assertIn("db1", runner._quarantined_databases)

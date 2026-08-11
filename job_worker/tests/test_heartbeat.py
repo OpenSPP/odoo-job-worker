@@ -187,9 +187,10 @@ class TestRunnerHeartbeat(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path))
 
     def test_update_skips_heartbeat_when_failures_exceed_threshold(self):
-        # Failure history survives the quarantine reset that rediscovery
-        # performs, so a database past the threshold keeps the heartbeat
-        # stale even when _quarantined_databases is momentarily empty.
+        # The failure history is checked independently of the quarantine set,
+        # so a database past the threshold keeps the heartbeat stale even when
+        # _quarantined_databases is empty — failures are recorded by worker
+        # threads, and the set is only armed from _record_failure.
         runner = self._make_runner(maximum_consecutive_failures=3)
         now = time.monotonic()
         runner._failure_timestamps["db1"] = [now, now, now]
