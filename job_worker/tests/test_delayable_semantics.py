@@ -768,9 +768,15 @@ class TestChainGraphEdgeCases(TransactionCase):
         self.assertEqual(parent.state, "failed")
         self.assertEqual(child.state, "failed")
 
-    def test_orphaned_child_when_parent_cancelled(self):
-        """If parent is cancelled, children should remain in waiting state
-        (cancelling doesn't cascade)."""
+    def test_child_is_cancelled_when_parent_cancelled(self):
+        """A cancelled parent cancels its waiting children instead of orphaning them.
+
+        REVERSED, deliberately. This previously asserted the child stayed in
+        ``waiting`` on the grounds that cancellation does not cascade. Nothing
+        can move that child afterwards: only completion calls
+        ``_release_dependents`` and only failure calls ``_fail_dependents``, so
+        a cancelled parent reaches neither and the child waits forever.
+        """
         parent = self.Job.enqueue(
             model_name="res.partner",
             method_name="create",
@@ -792,8 +798,7 @@ class TestChainGraphEdgeCases(TransactionCase):
 
         parent.button_cancelled()
         child.invalidate_recordset()
-        # Cancellation does not cascade — child remains orphaned in waiting
-        self.assertEqual(child.state, "waiting")
+        self.assertEqual(child.state, "cancelled")
 
     def test_deep_chain_does_not_stackoverflow(self):
         """A deeply nested chain should not cause a stack overflow

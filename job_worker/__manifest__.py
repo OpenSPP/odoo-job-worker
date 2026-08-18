@@ -1,7 +1,7 @@
 {
     "name": "Job Worker",
     "summary": "High-performance, SQL-driven 'Pull' architecture queue job engine",
-    "version": "19.0.1.2.0",
+    "version": "19.0.1.3.0",
     "category": "Generic Modules",
     "website": "https://github.com/OpenSPP",
     "author": "OpenSPP",
