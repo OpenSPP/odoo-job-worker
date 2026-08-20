@@ -819,20 +819,28 @@ class QueueJob(models.Model):
         wired onto a barrier that already carries an undecrementable dependency.
         """
         now = fields.Datetime.now()
-        # Skip jobs that already reached a terminal state. Without this a call on
-        # a ``done`` group member would cancel a HEALTHY barrier: the barrier's
-        # ``dependency_job_ids`` still lists that member (``_release_dependents``
-        # decrements the counter but never removes the id), so the ``@>``
-        # predicate matches and the cascade fires while the other members are
-        # still running. Before the cascade existed this call was a harmless
-        # no-op, which is why the guard was not needed until now.
-        cancellable = self.filtered(
-            lambda job: job.state not in ("done", "failed", "cancelled")
+        # Do NOT cascade from a job that had already reached a terminal state.
+        # Without this, a call on a ``done`` group member would cancel a HEALTHY
+        # barrier: the barrier's ``dependency_job_ids`` still lists that member
+        # (``_release_dependents`` decrements the counter but never removes the
+        # id), so the ``@>`` predicate matches and the cascade fires while the
+        # other members are still running. Before the cascade existed this call
+        # was a harmless no-op, which is why no guard was needed until now.
+        #
+        # The state write still applies to every job:
+        # ``test_button_cancelled_from_done`` pins that an already-terminal job
+        # MAY be cancelled ("System should allow it"), and this PR reverses one
+        # documented behaviour already. Only the cascade is withheld, which is
+        # where the hazard actually lives.
+        already_terminal = self.filtered(
+            lambda job: job.state in ("done", "failed", "cancelled")
         )
-        for job in cancellable:
+        for job in self:
             job.write({"state": "cancelled", "cancelled_at": now})
+        cascading = self - already_terminal
+        for job in cascading:
             job._cascade_children_on_parent_cancelled()
-        cancellable._cancel_dependents()
+        cascading._cancel_dependents()
 
     def open_related_action(self):
         """Open the record(s) targeted by this job."""

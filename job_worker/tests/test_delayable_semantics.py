@@ -1034,7 +1034,9 @@ class TestCancelCascadesAcrossDependencies(TransactionCase):
         member_a.button_cancelled()
         member_a.invalidate_recordset()
         barrier.invalidate_recordset()
-        self.assertEqual(member_a.state, "done", "a terminal job is not re-cancelled")
+        # The member itself DOES become cancelled — ``test_button_cancelled_from_done``
+        # pins that as deliberate. What must not happen is the CASCADE.
+        self.assertEqual(member_a.state, "cancelled")
         self.assertEqual(
-            barrier.state, "waiting", "and its healthy barrier is untouched"
+            barrier.state, "waiting", "its healthy barrier must be untouched"
         )
