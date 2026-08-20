@@ -71,7 +71,17 @@ class TestCancelledState(TransactionCase):
         self.assertEqual(job.state, "pending")
 
     def test_cancelled_children_on_parent_cancel(self):
-        """Cancelling a parent should not auto-cancel children."""
+        """Cancelling a parent cancels the children left waiting on it.
+
+        REVERSED, deliberately. This previously asserted the child stayed in
+        ``waiting`` and called that an explicit design choice. It is the bug:
+        the child waits for its parent to complete, the parent never will, and
+        nothing else ever moves it. ``waiting`` is not a terminal state, so the
+        row is invisible to every failure surface and survives ``_gc_old_jobs``
+        (which prunes only done/failed/cancelled) indefinitely.
+
+        Cancelled rather than failed: the parent did not fail, it never ran.
+        """
         from ..delay import chain as delay_chain
 
         a = self.env["res.partner"].create({"name": "Parent"})
@@ -84,9 +94,11 @@ class TestCancelledState(TransactionCase):
         parent_job = jobs[0]
         child_job = jobs[1]
         parent_job.button_cancelled()
+        child_job.invalidate_recordset()
         self.assertEqual(parent_job.state, "cancelled")
-        # Child remains in waiting - explicit design choice
-        self.assertEqual(child_job.state, "waiting")
+        self.assertEqual(
+            child_job.state, "cancelled", "a child of a cancelled parent can never run"
+        )
 
 
 @tagged("post_install", "-at_install")

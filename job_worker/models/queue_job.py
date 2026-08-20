@@ -613,6 +613,80 @@ class QueueJob(models.Model):
             )
         self.env.invalidate_all()
 
+    def _cancel_dependents(self):
+        """Cascade cancellation to multi-parent dependents.
+
+        A cancelled job never runs, so it produces neither success nor failure:
+        ``_release_dependents`` will never decrement its dependents' counters and
+        ``_fail_dependents`` never fires for it. Left alone, every dependent waits
+        on a condition that can no longer occur.
+
+        Cancellation propagates to BOTH dispositions, unlike failure. on_error
+        dependents are deliberately NOT promoted to pending: their handler exists
+        to react to a failure, and nothing failed here. Running it on a
+        cancellation would invent an error that never happened.
+        """
+        self.env.flush_all()
+        cancelled_ids = []
+        for job in self:
+            self.env.cr.execute(
+                """
+                UPDATE queue_job
+                SET state = 'cancelled',
+                    cancelled_at = NOW(),
+                    write_date = NOW()
+                WHERE state = 'waiting'
+                  AND dependency_job_ids IS NOT NULL
+                  AND dependency_job_ids @> (%s)::jsonb
+                RETURNING id
+                """,
+                (json.dumps([job.id]),),
+            )
+            cancelled_ids.extend(row[0] for row in self.env.cr.fetchall())
+        self.env.invalidate_all()
+        if cancelled_ids:
+            # Recurse across BOTH axes, or the strand this method closes simply
+            # reappears one hop away — reachable through the public API:
+            # ``group(a, b).on_done(chain(x, y))`` cancels the chain head ``x``
+            # here and leaves ``y`` (its ``parent_id`` child) waiting forever,
+            # and a nested group's inner barrier strands the same way.
+            #
+            # Termination is guaranteed without a visited set: every transition
+            # is waiting -> cancelled and the predicates match only ``waiting``
+            # rows, so each job can be walked at most once and even cyclic
+            # dependency data cannot loop.
+            newly = self.browse(cancelled_ids)
+            for job in newly:
+                job._cascade_children_on_parent_cancelled()
+            newly._cancel_dependents()
+
+    def _cascade_children_on_parent_cancelled(self):
+        """Cancel waiting ``parent_id`` descendants when this parent is cancelled.
+
+        Distinct from both sibling cascades, because a cancelled parent is neither
+        outcome the chain was wired for:
+
+        * ``_cascade_children_on_parent_success`` promotes on_done children to
+          ``pending`` — wrong here, since the parent never ran and its successor
+          must not run either;
+        * ``_cascade_children_on_parent_failure`` marks them ``failed`` with an
+          ``exc_info`` naming a failure that did not occur.
+
+        Both dispositions therefore cancel, and the walk continues downward: a
+        cancelled child never runs either, so it cannot cascade on its own behalf
+        and its descendants would be orphaned in ``waiting`` exactly as before.
+        """
+        self.ensure_one()
+        now = fields.Datetime.now()
+        queue = list(self.child_ids.filtered(lambda c: c.state == "waiting"))
+        while queue:
+            job = queue.pop(0)
+            job.write({"state": "cancelled", "cancelled_at": now})
+            queue.extend(job.child_ids.filtered(lambda c: c.state == "waiting"))
+            # Cross to the dependency axis too: a barrier waiting on this chain
+            # link would otherwise strand when the chain is cancelled upstream.
+            job._cancel_dependents()
+
     def button_requeue(self):
         for job in self:
             if job.identity_key:
@@ -729,9 +803,44 @@ class QueueJob(models.Model):
                     failed_queue.append(grandchild)
 
     def button_cancelled(self):
+        """Cancel these jobs, and everything left waiting on them.
+
+        The cascade is not optional bookkeeping. A cancelled job never reaches
+        ``_release_dependents`` (only completion calls it) and never reaches
+        ``_fail_dependents`` (only failure does), so anything waiting on it waits
+        on an event that can no longer happen. For a ``group(...).on_done(barrier)``
+        that is permanent: the barrier holds ``pending_dependency_count > 0``
+        forever, in a state no failure surface looks at — it is not ``failed``, not
+        ``cancelled``, and will never become ``pending``.
+
+        It also blocks its own recovery. ``enqueue`` dedupes ``identity_key``
+        against ``('waiting', 'pending', 'started')``, so re-dispatching the graph
+        returns the stranded barrier instead of a fresh one, and the new wave is
+        wired onto a barrier that already carries an undecrementable dependency.
+        """
         now = fields.Datetime.now()
+        # Do NOT cascade from a job that had already reached a terminal state.
+        # Without this, a call on a ``done`` group member would cancel a HEALTHY
+        # barrier: the barrier's ``dependency_job_ids`` still lists that member
+        # (``_release_dependents`` decrements the counter but never removes the
+        # id), so the ``@>`` predicate matches and the cascade fires while the
+        # other members are still running. Before the cascade existed this call
+        # was a harmless no-op, which is why no guard was needed until now.
+        #
+        # The state write still applies to every job:
+        # ``test_button_cancelled_from_done`` pins that an already-terminal job
+        # MAY be cancelled ("System should allow it"), and this PR reverses one
+        # documented behaviour already. Only the cascade is withheld, which is
+        # where the hazard actually lives.
+        already_terminal = self.filtered(
+            lambda job: job.state in ("done", "failed", "cancelled")
+        )
         for job in self:
             job.write({"state": "cancelled", "cancelled_at": now})
+        cascading = self - already_terminal
+        for job in cascading:
+            job._cascade_children_on_parent_cancelled()
+        cascading._cancel_dependents()
 
     def open_related_action(self):
         """Open the record(s) targeted by this job."""
