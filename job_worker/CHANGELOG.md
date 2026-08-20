@@ -4,6 +4,31 @@ Version history for the `job_worker` module. Entries are keyed by the module
 version in `__manifest__.py`, with the corresponding repository release tag
 noted where one exists.
 
+## 19.0.1.3.0 — unreleased
+
+### Changed
+
+- **Cancelling a job now cascades to everything waiting on it.** Previously
+  `button_cancelled` wrote `state = 'cancelled'` and cascaded nothing, so a
+  cancelled job's dependents waited on an event that could no longer occur:
+  `_release_dependents` runs only on completion and `_fail_dependents` only on
+  failure. For a `group(...).on_done(barrier)` that was permanent and silent —
+  the barrier held `pending_dependency_count > 0` in `waiting` forever, was
+  never pruned by `_gc_old_jobs` (which retires only terminal rows), and blocked
+  its own recovery, because `enqueue`'s `identity_key` dedupe matches `waiting`
+  and so handed a re-dispatched graph the stranded barrier instead of a fresh
+  one ([#32](https://github.com/OpenSPP/odoo-job-worker/pull/32)).
+
+  **This reverses a previously documented behaviour.** Two tests asserted the
+  orphaning and described it as an explicit design choice; both are updated
+  rather than removed, each with a docstring explaining the reversal.
+  Cancellation propagates as *cancellation*, not failure: `on_error` dependents
+  are **not** promoted to `pending`, because their handler exists to react to a
+  failure and a cancelled job never failed. Consumers that relied on a
+  cancelled job's dependents remaining runnable — e.g. "cancel this member,
+  then requeue it to let the graph finish" — must switch to re-dispatching the
+  graph, which the `identity_key` exit above now permits.
+
 ## 19.0.1.2.0 — unreleased
 
 ### Fixed

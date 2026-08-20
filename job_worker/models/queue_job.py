@@ -627,6 +627,7 @@ class QueueJob(models.Model):
         cancellation would invent an error that never happened.
         """
         self.env.flush_all()
+        cancelled_ids = []
         for job in self:
             self.env.cr.execute(
                 """
@@ -637,10 +638,27 @@ class QueueJob(models.Model):
                 WHERE state = 'waiting'
                   AND dependency_job_ids IS NOT NULL
                   AND dependency_job_ids @> (%s)::jsonb
+                RETURNING id
                 """,
                 (json.dumps([job.id]),),
             )
+            cancelled_ids.extend(row[0] for row in self.env.cr.fetchall())
         self.env.invalidate_all()
+        if cancelled_ids:
+            # Recurse across BOTH axes, or the strand this method closes simply
+            # reappears one hop away — reachable through the public API:
+            # ``group(a, b).on_done(chain(x, y))`` cancels the chain head ``x``
+            # here and leaves ``y`` (its ``parent_id`` child) waiting forever,
+            # and a nested group's inner barrier strands the same way.
+            #
+            # Termination is guaranteed without a visited set: every transition
+            # is waiting -> cancelled and the predicates match only ``waiting``
+            # rows, so each job can be walked at most once and even cyclic
+            # dependency data cannot loop.
+            newly = self.browse(cancelled_ids)
+            for job in newly:
+                job._cascade_children_on_parent_cancelled()
+            newly._cancel_dependents()
 
     def _cascade_children_on_parent_cancelled(self):
         """Cancel waiting ``parent_id`` descendants when this parent is cancelled.
@@ -665,6 +683,9 @@ class QueueJob(models.Model):
             job = queue.pop(0)
             job.write({"state": "cancelled", "cancelled_at": now})
             queue.extend(job.child_ids.filtered(lambda c: c.state == "waiting"))
+            # Cross to the dependency axis too: a barrier waiting on this chain
+            # link would otherwise strand when the chain is cancelled upstream.
+            job._cancel_dependents()
 
     def button_requeue(self):
         for job in self:
@@ -798,10 +819,20 @@ class QueueJob(models.Model):
         wired onto a barrier that already carries an undecrementable dependency.
         """
         now = fields.Datetime.now()
-        for job in self:
+        # Skip jobs that already reached a terminal state. Without this a call on
+        # a ``done`` group member would cancel a HEALTHY barrier: the barrier's
+        # ``dependency_job_ids`` still lists that member (``_release_dependents``
+        # decrements the counter but never removes the id), so the ``@>``
+        # predicate matches and the cascade fires while the other members are
+        # still running. Before the cascade existed this call was a harmless
+        # no-op, which is why the guard was not needed until now.
+        cancellable = self.filtered(
+            lambda job: job.state not in ("done", "failed", "cancelled")
+        )
+        for job in cancellable:
             job.write({"state": "cancelled", "cancelled_at": now})
             job._cascade_children_on_parent_cancelled()
-        self._cancel_dependents()
+        cancellable._cancel_dependents()
 
     def open_related_action(self):
         """Open the record(s) targeted by this job."""

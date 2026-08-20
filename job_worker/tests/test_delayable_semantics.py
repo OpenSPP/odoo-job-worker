@@ -906,3 +906,135 @@ class TestChainGraphEdgeCases(TransactionCase):
         for child in children:
             child.invalidate_recordset()
             self.assertEqual(child.state, "failed")
+
+
+@tagged("post_install", "-at_install")
+class TestCancelCascadesAcrossDependencies(TransactionCase):
+    """The dependency axis of the cancel cascade (`_cancel_dependents`).
+
+    This is the half the DSWD payroll strand actually runs through — a
+    ``group(*chunks).on_done(barrier)`` whose member is cancelled — and it had
+    no coverage: the two reversed tests exercise only the ``parent_id`` walk.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.Job = self.env["queue.job"]
+
+    def _partners(self, *names):
+        return [self.env["res.partner"].create({"name": n}) for n in names]
+
+    def test_cancelling_a_group_member_cancels_the_barrier(self):
+        """The headline case: the barrier must not be left orphaned in waiting.
+
+        ``cancelled``, not ``failed``: nothing failed, the member never ran.
+        And not ``waiting``, which is the bug — ``_release_dependents`` fires
+        only on completion, so nothing would ever decrement it again.
+        """
+        a, b, c = self._partners("CascA", "CascB", "CascC")
+        group(
+            a.delayable().write({"name": "CascA done"}),
+            b.delayable().write({"name": "CascB done"}),
+        ).on_done(c.delayable().write({"name": "CascC done"})).delay()
+        member_a, member_b, barrier = self.Job.search(
+            [], order="id desc", limit=3
+        ).sorted("id")
+        self.assertEqual(
+            barrier.state, "waiting", "premise: the barrier starts blocked"
+        )
+        self.assertIn(member_a.id, barrier.dependency_job_ids)
+
+        member_a.button_cancelled()
+        barrier.invalidate_recordset()
+        member_b.invalidate_recordset()
+        self.assertEqual(
+            barrier.state, "cancelled", "the barrier can never be released"
+        )
+        self.assertNotEqual(
+            barrier.state, "failed", "nothing failed — the member never ran"
+        )
+        self.assertEqual(member_b.state, "pending", "a sibling member is untouched")
+
+    def test_an_on_error_dependent_is_cancelled_not_promoted(self):
+        """Cancellation is not failure, so error handlers must not fire.
+
+        ``_fail_dependents`` promotes ``run_on_failure`` dependents to
+        ``pending`` so their handler runs. That is right for a failure and wrong
+        here: running an on_error callback for a cancelled job invents an error
+        that never happened.
+        """
+        a, b, c = self._partners("ErrA", "ErrB", "ErrC")
+        group(
+            a.delayable().write({"name": "ErrA done"}),
+            b.delayable().write({"name": "ErrB done"}),
+        ).on_error(c.delayable().write({"name": "ErrC handler"})).delay()
+        member_a, _member_b, handler = self.Job.search(
+            [], order="id desc", limit=3
+        ).sorted("id")
+        self.assertTrue(handler.run_on_failure, "premise: it is an on_error dependent")
+        self.assertEqual(handler.state, "waiting")
+
+        member_a.button_cancelled()
+        handler.invalidate_recordset()
+        self.assertEqual(handler.state, "cancelled")
+        self.assertNotEqual(
+            handler.state, "pending", "no failure occurred, so no handler runs"
+        )
+
+    def test_the_cascade_reaches_a_chain_behind_a_barrier(self):
+        """Composed graphs must not strand one hop down.
+
+        ``group(a, b).on_done(chain(x, y))``: ``x`` carries the
+        ``dependency_job_ids`` and ``y`` is ``x``'s ``parent_id`` child. Closing
+        only the dependency axis cancels ``x`` and leaves ``y`` waiting forever —
+        the same strand this fix exists to remove, one level down.
+        """
+        a, b, x, y = self._partners("ChainA", "ChainB", "ChainX", "ChainY")
+        group(
+            a.delayable().write({"name": "ChainA done"}),
+            b.delayable().write({"name": "ChainB done"}),
+        ).on_done(
+            chain(
+                x.delayable().write({"name": "ChainX done"}),
+                y.delayable().write({"name": "ChainY done"}),
+            )
+        ).delay()
+        jobs = self.Job.search([], order="id desc", limit=4).sorted("id")
+        member_a, head, tail = jobs[0], jobs[2], jobs[3]
+        self.assertEqual(
+            tail.parent_id.id, head.id, "premise: the chain tail hangs off the head"
+        )
+        self.assertEqual(tail.state, "waiting")
+
+        member_a.button_cancelled()
+        head.invalidate_recordset()
+        tail.invalidate_recordset()
+        self.assertEqual(head.state, "cancelled", "the barrier/chain head is cancelled")
+        self.assertEqual(tail.state, "cancelled", "and the cascade does not stop there")
+
+    def test_cancelling_a_done_member_leaves_a_healthy_barrier_alone(self):
+        """``dependency_job_ids`` keeps a completed member's id forever.
+
+        ``_release_dependents`` decrements the counter but never removes the id,
+        so the ``@>`` predicate still matches a ``done`` member. Without a
+        terminal-state guard, cancelling one would cancel a healthy barrier whose
+        other members are still running — a call that was a harmless no-op before
+        this cascade existed.
+        """
+        a, b, c = self._partners("DoneA", "DoneB", "DoneC")
+        group(
+            a.delayable().write({"name": "DoneA done"}),
+            b.delayable().write({"name": "DoneB done"}),
+        ).on_done(c.delayable().write({"name": "DoneC done"})).delay()
+        member_a, _member_b, barrier = self.Job.search(
+            [], order="id desc", limit=3
+        ).sorted("id")
+        member_a.write({"state": "done"})
+
+        member_a.button_cancelled()
+        member_a.invalidate_recordset()
+        barrier.invalidate_recordset()
+        self.assertEqual(member_a.state, "done", "a terminal job is not re-cancelled")
+        self.assertEqual(
+            barrier.state, "waiting", "and its healthy barrier is untouched"
+        )
