@@ -190,6 +190,11 @@ class QueueJobRunner:
         self._advisory_lock_connections = {}
         self._failure_timestamps = {}
         self._quarantined_databases = set()
+        # Thread objects whose death has already been counted, so that one
+        # corpse contributes exactly one failure timestamp however many
+        # supervisor ticks it sits in ``_worker_threads`` for. Entries are
+        # discarded with the thread they refer to.
+        self._deaths_counted = set()
         # db_name -> monotonic timestamp when its registry load first failed
         # with a database error. Cleared once the registry loads.
         self._registry_load_retry_since = {}
@@ -264,7 +269,7 @@ class QueueJobRunner:
 
     def discover_databases(self):
         """Find databases, check for module, acquire locks, manage workers."""
-        self._quarantined_databases.clear()
+        self._expire_quarantines()
         database_names = self.database_names or _get_database_names()
         active_databases = set()
 
@@ -311,12 +316,24 @@ class QueueJobRunner:
         thread.start()
         _logger.info("Started worker thread for database %s", db_name)
 
+    def _forget_thread(self, db_name):
+        """Drop the thread entry for *db_name*, and return it.
+
+        Kept in one place so the ``_deaths_counted`` bookkeeping cannot
+        outlive the thread it refers to: every removal from
+        ``_worker_threads`` goes through here.
+        """
+        thread = self._worker_threads.pop(db_name, None)
+        if thread is not None:
+            self._deaths_counted.discard(thread)
+        return thread
+
     def _stop_worker_thread(self, db_name):
         """Signal and join the worker thread for *db_name*."""
         local_event = self._per_database_stop_events.pop(db_name, None)
         if local_event:
             local_event.set()
-        thread = self._worker_threads.pop(db_name, None)
+        thread = self._forget_thread(db_name)
         if thread:
             thread.join(timeout=self.join_timeout_seconds)
             if thread.is_alive():
@@ -337,9 +354,26 @@ class QueueJobRunner:
                     exc_info=True,
                 )
         self._failure_timestamps.pop(db_name, None)
+        # The quarantine has to go with the history it was armed from. Left
+        # behind, it keeps ``_fleet_is_degraded`` reporting a database this
+        # process no longer serves, withholding the heartbeat past the
+        # healthcheck's staleness threshold for no live fault.
+        self._quarantined_databases.discard(db_name)
 
     def _check_thread_health(self):
-        """Restart dead threads unless quarantined or stopping."""
+        """Restart dead threads unless quarantined or stopping.
+
+        A corpse is counted **once**. It has to be, because a dead thread is
+        not removed from ``_worker_threads`` while its database is
+        quarantined: without ``_deaths_counted`` the same corpse is re-counted
+        on every tick that finds the quarantine lifted, and a single stamp per
+        discovery pass is enough to keep the failure window full forever — the
+        database is then never retried, which is #30 in a subtler shape than
+        the one ``_expire_quarantines`` fixes. Counting once also stops an
+        exception crash being stamped twice (here and in
+        ``_worker_thread_target``), which made ``maximum_consecutive_failures``
+        quarantine after half as many real crashes as it says.
+        """
         for db_name in list(self._worker_threads):
             if self.stop_event.is_set():
                 return
@@ -350,11 +384,15 @@ class QueueJobRunner:
                 _logger.debug("Database %s is quarantined, not restarting", db_name)
                 continue
             _logger.warning("Worker for %s is dead, restarting", db_name)
-            self._record_failure(db_name)
+            if thread not in self._deaths_counted:
+                # A clean ``return`` from the worker records nothing itself,
+                # so the health check is the only place that can count it.
+                self._deaths_counted.add(thread)
+                self._record_failure(db_name)
             if db_name in self._quarantined_databases:
                 continue
             # Remove old thread entry and start fresh
-            self._worker_threads.pop(db_name, None)
+            self._forget_thread(db_name)
             self._worker_instances.pop(db_name, None)
             self._per_database_stop_events.pop(db_name, None)
             self._start_worker_thread(db_name)
@@ -496,15 +534,57 @@ class QueueJobRunner:
         logging.shutdown()
         os._exit(1)
 
+    def _recent_failure_count(self, db_name):
+        """Prune failures outside the window and return how many remain.
+
+        Pruning on *read* as well as on write is what lets a quarantine
+        expire. A quarantined database records no new failures — the health
+        check skips it before reaching ``_record_failure`` — so its history
+        only ages, and nothing else would ever notice that it had.
+        """
+        timestamps = self._failure_timestamps.get(db_name)
+        if not timestamps:
+            return 0
+        cutoff = time.monotonic() - self.failure_window_seconds
+        remaining = [ts for ts in timestamps if ts >= cutoff]
+        if remaining:
+            self._failure_timestamps[db_name] = remaining
+        else:
+            self._failure_timestamps.pop(db_name, None)
+        return len(remaining)
+
+    def _expire_quarantines(self):
+        """Release databases whose failures have aged out of the window.
+
+        Runs once per discovery pass, in place of the unconditional
+        ``_quarantined_databases.clear()`` this replaces. That clear looked
+        like it granted a quarantined database another chance, but it did the
+        opposite: with the set emptied, ``_check_thread_health`` re-counted
+        the *same* dead thread on the next tick and re-armed the quarantine.
+        One corpse recounted once per pass keeps the window permanently full,
+        so the pruning meant to release the database could never drain and it
+        was retried exactly zero times — a five-hour queue stall on dev
+        payroll, 2026-08-11 (#30), long after the fault behind it had cleared.
+
+        Expiring on the pruned history instead bounds a quarantine to at most
+        one ``failure_window_seconds`` past the last genuine death — but only
+        because ``_check_thread_health`` counts each corpse once. Re-counting
+        it reinstates the same permanent lock one stamp at a time, so the two
+        halves of the fix are not separable.
+        """
+        for db_name in sorted(self._quarantined_databases):
+            if self._recent_failure_count(db_name) >= self.maximum_consecutive_failures:
+                continue
+            self._quarantined_databases.discard(db_name)
+            _logger.info(
+                "Quarantine expired for database %s; it will be retried",
+                db_name,
+            )
+
     def _record_failure(self, db_name):
         """Track a failure timestamp and quarantine if threshold exceeded."""
-        now = time.monotonic()
-        timestamps = self._failure_timestamps.setdefault(db_name, [])
-        timestamps.append(now)
-        # Prune old timestamps outside the failure window
-        cutoff = now - self.failure_window_seconds
-        self._failure_timestamps[db_name] = [ts for ts in timestamps if ts >= cutoff]
-        if len(self._failure_timestamps[db_name]) >= self.maximum_consecutive_failures:
+        self._failure_timestamps.setdefault(db_name, []).append(time.monotonic())
+        if self._recent_failure_count(db_name) >= self.maximum_consecutive_failures:
             _logger.error(
                 "Database %s quarantined after %d failures in %ds",
                 db_name,
@@ -543,10 +623,11 @@ class QueueJobRunner:
         A quarantined database is degraded by definition.  We also treat a
         database whose recent failure count has reached the quarantine
         threshold as degraded even when it is not currently quarantined:
-        ``discover_databases`` clears the quarantine set on every pass, but
-        ``_failure_timestamps`` survives, so checking the failure history
-        keeps the signal stable for a persistently broken database instead
-        of flapping healthy after each rediscovery.
+        ``discover_databases`` releases a quarantine as soon as the pruned
+        history drops below the threshold, and a released database is
+        restarted before anything proves it healthy, so reading the failure
+        history keeps the signal stable across that retry instead of
+        flapping healthy on every expiry.
 
         Neither of those can see a database that is *unreachable* rather than
         crashing, because a database error now recovers in place and records no
@@ -611,6 +692,9 @@ class QueueJobRunner:
             _logger.info("Worker stopped for database %s", db_name)
         except Exception:
             _logger.exception("Worker crashed for database %s", db_name)
+            # Claim this death before the supervisor can see the thread end,
+            # so ``_check_thread_health`` does not stamp the same crash again.
+            self._deaths_counted.add(threading.current_thread())
             self._record_failure(db_name)
         finally:
             self._worker_instances.pop(db_name, None)
