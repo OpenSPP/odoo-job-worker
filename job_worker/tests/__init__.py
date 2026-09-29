@@ -44,3 +44,4 @@ from . import test_cross_graph_barriers
 from . import test_worker_run_on_failure
 from . import test_upgrade_gate_probe
 from . import test_worker_upgrade_gate
+from . import test_deploy_upgrade_gate

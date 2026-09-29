@@ -468,3 +468,39 @@ def install_module(db_name, module_name):
             f"failed to install {module_name} into {db_name}: "
             f"stderr={result.stderr[-2000:].decode('utf-8', errors='replace')}"
         )
+
+
+def upgrade_module(db_name, module_name, timeout=180):
+    """Upgrade ``module_name`` in ``db_name`` via a one-shot ``odoo -u`` subprocess.
+
+    The deploy-time counterpart of :func:`install_module`, for scenarios that
+    need a real module upgrade to run beside a live runner. Returns the
+    completed process so callers can inspect its output.
+    """
+    cfg = odoo.tools.config
+    addons_path = cfg["addons_path"]
+    if isinstance(addons_path, list):
+        addons_path = ",".join(addons_path)
+    argv = [
+        "odoo",
+        "-d",
+        db_name,
+        "--addons-path=" + addons_path,
+        "-u",
+        module_name,
+        "--stop-after-init",
+        "--log-level=warn",
+        "--workers=0",
+    ]
+    for key in ("db_host", "db_port", "db_user", "db_password"):
+        value = cfg.get(key)
+        if value:
+            argv.append(f"--{key}={value}")
+    _logger.info("Upgrading %s in %s", module_name, db_name)
+    result = subprocess.run(argv, capture_output=True, timeout=timeout, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"failed to upgrade {module_name} in {db_name}: "
+            f"stderr={result.stderr[-2000:].decode('utf-8', errors='replace')}"
+        )
+    return result
