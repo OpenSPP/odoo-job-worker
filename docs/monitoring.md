@@ -109,3 +109,4 @@ If jobs are not running:
 3. **Check channel limits** — Verify `queue.limit` records allow sufficient concurrency
 4. **Check PostgreSQL connectivity** — Worker needs a direct database connection
 5. **Inspect heartbeats** — Stale heartbeats indicate worker crashes; jobs will be auto-recovered
+6. **Look for an upgrade pause** — `Job worker paused for database <db>: <reason>` means the upgrade gate is holding the worker back, and names what to do. It resumes by itself (`Job worker resumed for database <db> after …`); while paused it logs `still paused` every 5 minutes, and an ERROR once the pause outlasts `JOB_WORKER_UPGRADE_PAUSE_UNHEALTHY_AFTER`. See [Upgrading modules while the worker runs](deployment.md#upgrading-modules-while-the-worker-runs)
