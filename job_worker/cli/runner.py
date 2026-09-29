@@ -10,7 +10,9 @@ import psycopg2
 
 import odoo
 
+from . import process_guards
 from .heartbeat import heartbeat_file_path, write_heartbeat
+from .upgrade_gate import UpgradeGate
 from .worker import QueueWorker
 
 _logger = logging.getLogger(__name__)
@@ -22,6 +24,38 @@ PG_ADVISORY_LOCK_ID = 7283946150382917643
 # Default technical name of this addon, used to check whether
 # the module is installed in a given database.
 _MODULE_NAME = "job_worker"
+
+_TRUE_VALUES = ("1", "true", "yes", "on")
+_FALSE_VALUES = ("0", "false", "no", "off")
+
+
+def _env_flag(name, default):
+    """Read a boolean environment variable, rejecting anything unrecognised."""
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_VALUES:
+        return True
+    if raw in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"{name} must be one of {'/'.join(_TRUE_VALUES + _FALSE_VALUES)}, "
+        f"got {os.environ[name]!r}"
+    )
+
+
+def _env_seconds(name, default, minimum):
+    """Read a duration in seconds from the environment, with a lower bound."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be a number of seconds, got {raw!r}") from None
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}, got {raw!r}")
+    return value
 
 
 class CompositeStopEvent:
@@ -153,6 +187,7 @@ class QueueJobRunner:
         database_unhealthy_after_seconds=300,
         registry_load_backoff_seconds=1,
         registry_load_backoff_cap_seconds=60,
+        upgrade_gate_keyword_arguments=None,
     ):
         self.database_names = database_names
         self.discovery_interval_seconds = discovery_interval_seconds
@@ -182,6 +217,10 @@ class QueueJobRunner:
             self.registry_load_backoff_seconds,
             float(registry_load_backoff_cap_seconds),
         )
+        # Passed to each database's UpgradeGate. The gate is on unless these
+        # say ``enabled=False``: a worker that loads its registry during a
+        # module upgrade can reset the upgrading process's module states.
+        self.upgrade_gate_keyword_arguments = upgrade_gate_keyword_arguments or {}
 
         self.stop_event = threading.Event()
         self._worker_threads = {}
@@ -198,6 +237,9 @@ class QueueJobRunner:
         # db_name -> monotonic timestamp when its registry load first failed
         # with a database error. Cleared once the registry loads.
         self._registry_load_retry_since = {}
+        # db_name -> the UpgradeGate shared by that database's registry load
+        # and its QueueWorker, read here for the degraded signal.
+        self._upgrade_gates = {}
 
     @classmethod
     def from_environ_or_config(cls):
@@ -234,15 +276,29 @@ class QueueJobRunner:
             os.environ.get("QUEUE_JOB_RUNNER_USE_ADVISORY_LOCK", "1").strip().lower()
         )
         use_advisory_lock = advisory_lock_env not in ("0", "false", "no", "off")
+        upgrade_gate_kwargs = {
+            "enabled": _env_flag("JOB_WORKER_UPGRADE_GATE", True),
+            "version_check": _env_flag("JOB_WORKER_UPGRADE_GATE_VERSION_CHECK", True),
+            "interval_seconds": _env_seconds(
+                "JOB_WORKER_UPGRADE_GATE_INTERVAL", 5, minimum=0.1
+            ),
+            "unhealthy_after_seconds": _env_seconds(
+                "JOB_WORKER_UPGRADE_PAUSE_UNHEALTHY_AFTER", 3600, minimum=0
+            ),
+        }
         return cls(
             database_names=database_names,
             use_advisory_lock=use_advisory_lock,
             worker_keyword_arguments=worker_kwargs,
+            upgrade_gate_keyword_arguments=upgrade_gate_kwargs,
             **runner_kwargs,
         )
 
     def run(self):
         """Main supervisor loop."""
+        # Before any registry is loaded: this process must never reset module
+        # states, whatever happens to its registry loads (see process_guards).
+        process_guards.install()
         self._setup_signal_handlers()
         last_discovery = 0  # force immediate first discovery
 
@@ -635,9 +691,19 @@ class QueueJobRunner:
         or recovering inside the main loop for longer than
         ``database_unhealthy_after_seconds`` is degraded too — that is what
         keeps a wedged database from looking healthy while it serves nothing.
+
+        A database paused by its upgrade gate is healthy for an ordinary
+        upgrade window and degraded once the pause outlasts the gate's own
+        ``unhealthy_after_seconds``: an upgrade that never finishes, or code
+        deployed without its ``-u``, serves nothing just as surely. That check
+        has its own threshold, so it applies even when
+        ``database_unhealthy_after_seconds`` is 0.
         """
         if self._quarantined_databases:
             return True
+        for upgrade_gate in list(self._upgrade_gates.values()):
+            if upgrade_gate.is_overdue():
+                return True
         cutoff = time.monotonic() - self.failure_window_seconds
         # Snapshot the values: a crashing worker thread may add a key to
         # _failure_timestamps via _record_failure concurrently, and iterating
@@ -675,14 +741,22 @@ class QueueJobRunner:
         Pre-loads the Odoo registry before starting the worker loop so
         that module import errors surface as clear startup failures
         rather than being masked as job execution errors.
+
+        One UpgradeGate serves the database for the life of this thread: the
+        registry load waits on it, the worker pauses on it, and the supervisor
+        reads it for the degraded signal, so a pause is measured once however
+        it is reached.
         """
+        upgrade_gate = UpgradeGate(db_name, **self.upgrade_gate_keyword_arguments)
+        self._upgrade_gates[db_name] = upgrade_gate
         try:
             _logger.info("Worker starting for database %s", db_name)
-            if not self._load_registry(db_name, composite_stop_event):
+            if not self._load_registry(db_name, composite_stop_event, upgrade_gate):
                 return
             worker = QueueWorker(
                 db_name,
                 stop_event=composite_stop_event,
+                upgrade_gate=upgrade_gate,
                 **self.worker_keyword_arguments,
             )
             # Publish the instance so the supervisor's progress watchdog can
@@ -699,8 +773,12 @@ class QueueJobRunner:
         finally:
             self._worker_instances.pop(db_name, None)
             self._registry_load_retry_since.pop(db_name, None)
+            # Only our own: a replacement thread for this database may already
+            # have registered its gate.
+            if self._upgrade_gates.get(db_name) is upgrade_gate:
+                del self._upgrade_gates[db_name]
 
-    def _load_registry(self, db_name, stop_event):
+    def _load_registry(self, db_name, stop_event, upgrade_gate=None):
         """Load the Odoo registry, retrying in place on a *database* error.
 
         Returns True once loaded, False if asked to stop before that.
@@ -720,10 +798,20 @@ class QueueJobRunner:
         definition — still propagates to the caller and is recorded, which
         keeps the original intent that startup errors surface loudly rather
         than being masked.
+
+        With an ``upgrade_gate``, nothing is loaded while it is closed: a
+        registry load during another process's module install/upgrade runs
+        every ``_register_hook`` against a database in mid-change, and can
+        resume a partial upgrade itself. A database error from the gate's
+        probe backs off exactly like one from the load.
         """
         attempt = 0
         while not stop_event.is_set():
             try:
+                if upgrade_gate is not None and not self._wait_for_upgrade_gate(
+                    upgrade_gate, stop_event
+                ):
+                    return False
                 _logger.info("Loading registry for database %s", db_name)
                 from odoo.orm.registry import Registry
 
@@ -749,6 +837,15 @@ class QueueJobRunner:
             _logger.info("Registry loaded for database %s", db_name)
             self._registry_load_retry_since.pop(db_name, None)
             return True
+        return False
+
+    @staticmethod
+    def _wait_for_upgrade_gate(upgrade_gate, stop_event):
+        """Block until the gate opens; False if asked to stop first."""
+        while not stop_event.is_set():
+            if upgrade_gate.is_open():
+                return True
+            stop_event.wait(upgrade_gate.interval_seconds)
         return False
 
     def _setup_signal_handlers(self):

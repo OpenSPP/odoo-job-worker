@@ -23,6 +23,7 @@ _RUNNER_TEST_FILES = [
     "test_runner_thread_management.py",
     "test_heartbeat.py",
     "test_upgrade_gate.py",
+    "test_runner_upgrade_gate.py",
 ]
 
 
