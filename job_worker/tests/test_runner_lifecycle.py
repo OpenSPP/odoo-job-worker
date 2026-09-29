@@ -3,7 +3,7 @@ import os
 import signal
 import threading
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 # Load runner module with stubbed Odoo dependencies.
 _helpers_path = os.path.join(os.path.dirname(__file__), "_runner_test_helpers.py")
@@ -176,6 +176,8 @@ class TestRunnerLifecycle(unittest.TestCase):
             database_names=["db1"],
             use_advisory_lock=False,
             worker_keyword_arguments={"concurrency": 2},
+            # The gate's probe needs a database; its wiring has its own tests.
+            upgrade_gate_keyword_arguments={"enabled": False},
         )
         mock_registry_class = MagicMock()
         mock_registry = mock_registry_class.return_value
@@ -203,6 +205,10 @@ class TestRunnerLifecycle(unittest.TestCase):
         mock_worker_class.assert_called_once_with(
             "db1",
             stop_event=composite,
+            upgrade_gate=ANY,
             concurrency=2,
+        )
+        self.assertIsInstance(
+            mock_worker_class.call_args.kwargs["upgrade_gate"], _runner.UpgradeGate
         )
         mock_worker_instance.run.assert_called_once()

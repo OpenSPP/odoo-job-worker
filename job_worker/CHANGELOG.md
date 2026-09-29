@@ -6,6 +6,27 @@ noted where one exists.
 
 ## 19.0.1.3.0 — unreleased
 
+### Fixed
+
+- **The job worker no longer interferes with module installs and upgrades run
+  by another process.** Loading an Odoo registry is not read-only: it runs every
+  `_register_hook`, resumes a partial upgrade it finds flagged, and on failure
+  calls `reset_modules_state()`, which marked an in-progress upgrade's
+  `to upgrade` modules `installed` from the worker process ("Transient module
+  states were reset"). A per-database **upgrade gate** now closes while any
+  module is `to install`/`to upgrade`/`to remove`, while
+  `base.partially_updated_database` is set, while an installed module's code
+  version differs from the database's, or while its probe is blocked by a lock.
+  While it is closed the worker neither loads nor reloads its registry nor takes
+  new jobs; running jobs keep their heartbeat, and the worker resumes (and
+  reloads the upgraded registry) on its own. The runner process also replaces
+  `reset_modules_state` with a warning, so it can never reset module states.
+  A pause longer than `JOB_WORKER_UPGRADE_PAUSE_UNHEALTHY_AFTER` (default
+  3600s) is reported unhealthy. New settings: `JOB_WORKER_UPGRADE_GATE`,
+  `JOB_WORKER_UPGRADE_GATE_VERSION_CHECK`, `JOB_WORKER_UPGRADE_GATE_INTERVAL`,
+  `JOB_WORKER_UPGRADE_PAUSE_UNHEALTHY_AFTER`. A bare `QueueWorker` is only gated
+  when given an `upgrade_gate`.
+
 ### Changed
 
 - **Cancelling a job now cascades to everything waiting on it.** Previously

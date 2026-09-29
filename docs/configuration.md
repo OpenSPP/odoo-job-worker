@@ -18,6 +18,7 @@ The `QueueWorker` class accepts these parameters:
 | `transient_registry_max_age_seconds` | `3600` | How long a transient registry error is retried without counting toward `max_retries` |
 | `database_error_backoff_seconds` | `1` | Initial wait after a database error in the worker's main loop; the worker recovers in place (drops the session, backs off, takes a fresh one) rather than dying |
 | `database_error_backoff_cap_seconds` | `60` | Cap for that exponential backoff. Must stay below `worker_stall_timeout_seconds`, or the stall watchdog would kill a correctly-recovering worker |
+| `upgrade_gate` | `None` | An `UpgradeGate` to pause on while modules are installed or upgraded. The runner always passes one; a bare `QueueWorker` without it is not gated (see [Deployment](deployment.md#upgrading-modules-while-the-worker-runs)) |
 
 ### Environment Variables
 
@@ -37,6 +38,17 @@ use:
 The runner also reads the heartbeat settings `JOB_WORKER_HEARTBEAT_FILE` and
 `JOB_WORKER_HEARTBEAT_MAX_AGE`; see [Deployment](deployment.md#health-checks).
 
+The upgrade-gate settings pause the worker while modules are installed or
+upgraded; see [Deployment](deployment.md#upgrading-modules-while-the-worker-runs).
+Invalid values stop the runner at startup with an error naming the variable:
+
+| Variable | Default | Description |
+|---|---|---|
+| `JOB_WORKER_UPGRADE_GATE` | `1` | `0`/`false`/`no`/`off` disables the gate |
+| `JOB_WORKER_UPGRADE_GATE_VERSION_CHECK` | `1` | `0` skips the code-vs-database module version check |
+| `JOB_WORKER_UPGRADE_GATE_INTERVAL` | `5` | Seconds between gate checks (minimum 0.1) |
+| `JOB_WORKER_UPGRADE_PAUSE_UNHEALTHY_AFTER` | `3600` | Seconds paused before the runner reports unhealthy; `0` never |
+
 ## Runner Parameters
 
 The `QueueJobRunner` supervises workers across multiple databases.
@@ -52,6 +64,7 @@ The `QueueJobRunner` supervises workers across multiple databases.
 | `database_unhealthy_after_seconds` | `300` | A database stuck in database-error recovery (main loop or registry load) for this long counts as degraded, which withholds the runner heartbeat so the container healthcheck fails |
 | `registry_load_backoff_seconds` | `1` | Initial wait when registry load hits a database error; the load is retried in place instead of counting as a worker death |
 | `registry_load_backoff_cap_seconds` | `60` | Cap for that exponential backoff |
+| `upgrade_gate_keyword_arguments` | `{}` (gate on) | Passed to each database's `UpgradeGate` (`enabled`, `version_check`, `interval_seconds`, `unhealthy_after_seconds`). Set from the `JOB_WORKER_UPGRADE_*` variables by `from_environ_or_config()` |
 
 The database-error recovery and degraded-health parameters
 (`database_error_backoff_*`, `registry_load_backoff_*`,

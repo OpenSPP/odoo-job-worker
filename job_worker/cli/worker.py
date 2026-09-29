@@ -163,6 +163,7 @@ class QueueWorker:
         transient_registry_max_age_seconds=3600,
         database_error_backoff_seconds=1,
         database_error_backoff_cap_seconds=60,
+        upgrade_gate=None,
     ):
         self.db_name = db_name
         self.worker_uuid = str(uuid.uuid4())
@@ -211,6 +212,11 @@ class QueueWorker:
         # seconds_in_database_error_recovery().
         self._database_error_streak = 0
         self._database_error_streak_started_at = None
+        # An UpgradeGate (see upgrade_gate.py), or None for no gating. The
+        # runner always passes one; a bare QueueWorker keeps its historical
+        # behaviour unless given one.
+        self.upgrade_gate = upgrade_gate
+        self._upgrade_gate_was_open = True
         self.db = odoo.sql_db.db_connect(self.db_name)
         self._pool = ThreadPoolExecutor(
             max_workers=self.concurrency,
@@ -238,6 +244,23 @@ class QueueWorker:
             registry.check_signaling()
         except Exception:
             _logger.warning("Registry check failed for %s", self.db_name, exc_info=True)
+
+    def _upgrade_gate_is_open(self):
+        """Whether the registry may be reloaded and new jobs taken right now.
+
+        Closed while another process installs or upgrades modules (see
+        ``upgrade_gate.py``). On the transition back to open the registry
+        check is made due immediately, so the upgraded registry is picked up
+        now rather than up to ``registry_check_interval`` later. A database
+        error from the gate's probe propagates to ``run()``'s recovery.
+        """
+        if self.upgrade_gate is None:
+            return True
+        is_open = self.upgrade_gate.is_open()
+        if is_open and not self._upgrade_gate_was_open:
+            self._last_registry_check = float("-inf")
+        self._upgrade_gate_was_open = is_open
+        return is_open
 
     def run(self):
         """Main worker loop. A database error recovers here, in place.
@@ -312,11 +335,15 @@ class QueueWorker:
                 # loop stops advancing this even though the thread lives.
                 self.last_progress = time.monotonic()
 
-                # 0. Check for registry changes (module install/update)
-                self._check_registry()
+                # While a module install/upgrade owns the database, neither
+                # reload the registry (it runs every _register_hook) nor take
+                # new jobs. Jobs already running keep their heartbeat below.
+                if self._upgrade_gate_is_open():
+                    # 0. Check for registry changes (module install/update)
+                    self._check_registry()
 
-                # 1. Process jobs until queue is empty or limit reached
-                self.process_jobs()
+                    # 1. Process jobs until queue is empty or limit reached
+                    self.process_jobs()
 
                 # 2. Update heartbeats for currently running jobs (if any).
                 # A transient DB timeout here must not crash the loop (see
@@ -438,6 +465,10 @@ class QueueWorker:
             with self._active_lock:
                 if len(self.active_job_ids) >= self.concurrency:
                     break
+            # Re-checked per acquisition (the gate caches its probe), so a
+            # long drain cannot keep taking jobs after an upgrade starts.
+            if not self._upgrade_gate_is_open():
+                break
             try:
                 job_id = self._acquire_job()
             except OperationalError as err:

@@ -841,7 +841,9 @@ class TestQuarantineExpires(unittest.TestCase):
         half its stated number of real crashes — and, once a quarantine can
         expire, is the extra stamp that keeps the window full.
         """
-        runner = self._make_runner()
+        # Gate off: its probe needs a database, and the crash under test is
+        # the registry's own.
+        runner = self._make_runner(upgrade_gate_keyword_arguments={"enabled": False})
         registry_class = MagicMock(side_effect=RuntimeError("broken module"))
         composite = threading.Event()
 
