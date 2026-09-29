@@ -91,6 +91,21 @@ def load_runner():
     sys.modules["job_worker.cli.heartbeat"] = heartbeat_mod
     cli_stub.heartbeat = heartbeat_mod
 
+    # The upgrade gate and the process guard import Odoo lazily, so the real
+    # modules load against the stubs above. Loaded once and kept, so every
+    # test module sees the same module objects the runner imported.
+    for name in ("upgrade_gate", "process_guards"):
+        qualified = f"job_worker.cli.{name}"
+        if qualified not in sys.modules:
+            module_spec = importlib.util.spec_from_file_location(
+                qualified, os.path.join(cli_dir, f"{name}.py")
+            )
+            module = importlib.util.module_from_spec(module_spec)
+            module.__package__ = "job_worker.cli"
+            module_spec.loader.exec_module(module)
+            sys.modules[qualified] = module
+        setattr(cli_stub, name, sys.modules[qualified])
+
     # Load the runner module as part of the job_worker.cli package
     runner_path = os.path.join(cli_dir, "runner.py")
     spec = importlib.util.spec_from_file_location(

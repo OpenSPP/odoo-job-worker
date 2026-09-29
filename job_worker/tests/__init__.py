@@ -42,3 +42,4 @@ from . import test_stress_s9_notify_flood
 from . import test_diagnose_worker_hang
 from . import test_cross_graph_barriers
 from . import test_worker_run_on_failure
+from . import test_upgrade_gate_probe
